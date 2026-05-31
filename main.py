@@ -1,16 +1,17 @@
-# This is a sample Python script.
+import uvicorn
+from fastapi import FastAPI
+from dotenv import load_dotenv
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
-
-
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
+from app.api import prompt_router
 
 
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
+app = FastAPI()
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+app.include_router(prompt_router)
+
+
+if __name__ == "__main__":
+
+    load_dotenv()
+
+    uvicorn.run("main:app", host='127.0.0.1', port=8066, reload=True, workers=3)
