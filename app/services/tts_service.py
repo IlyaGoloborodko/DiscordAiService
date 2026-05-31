@@ -1,5 +1,5 @@
+from typing import AsyncGenerator
 import asyncio
-import sounddevice as sd
 
 from wyoming.client import AsyncTcpClient
 from wyoming.tts import Synthesize, SynthesizeVoice
@@ -9,7 +9,8 @@ HOST = "127.0.0.1"
 PORT = 4215
 
 
-async def text_to_speech(text: str):
+async def text_to_speech(text: str) -> AsyncGenerator[bytes, None]:
+    """Пока тестирование на локальном tts"""
     client = AsyncTcpClient(HOST, PORT)
     await client.connect()
 
@@ -20,7 +21,7 @@ async def text_to_speech(text: str):
         ).event()
     )
 
-    stream = None
+    stream_started = False
 
     try:
         while True:
@@ -29,30 +30,16 @@ async def text_to_speech(text: str):
                 break
 
             if event.type == "audio-start":
-                rate = event.data["rate"]
-                width = event.data["width"]
-                channels = event.data["channels"]
-
-                if width != 2:
-                    raise RuntimeError(f"Expected 16-bit PCM (width=2), got width={width}")
-
-                stream = sd.RawOutputStream(
-                    samplerate=rate,
-                    channels=channels,
-                    dtype="int16",
-                )
-                stream.start()
-
+                stream_started = True
+                continue
             elif event.type == "audio-chunk":
-                raw = event.payload or b""
-                if raw and stream is not None:
-                    stream.write(raw)
+                if stream_started:
+                    raw = event.payload or b""
+                    if raw:
+                        yield raw
 
             elif event.type == "audio-stop":
                 break
 
     finally:
-        if stream is not None:
-            stream.stop()
-            stream.close()
         await client.disconnect()

@@ -1,4 +1,5 @@
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 
 from app.data.models import PromptInfo
 from app.services import PromptService
@@ -7,10 +8,10 @@ prompt_router = APIRouter()
 
 
 @prompt_router.post("/prompt")
-def user_prompt(prompt: PromptInfo):
-
+async def user_prompt(prompt: PromptInfo):
     prompt_service = PromptService()
-    result = prompt_service()
-
-    return {"message": "Hello, World!"}
+    return StreamingResponse(
+        prompt_service.process_prompt(prompt),
+        media_type="application/octet-stream"
+    )
 

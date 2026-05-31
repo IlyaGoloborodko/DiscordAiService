@@ -1,11 +1,12 @@
 import os
+from typing import Any
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, AgentRunResult
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from app.data.models import PromptInfo
-from . import text_to_speech
+from .tts_service import text_to_speech
 
 class PromptService:
     def __init__(self):
@@ -18,16 +19,17 @@ class PromptService:
             api_key=self.tm_api_key
         )
 
-    async def process_prompt(self, prompt_info: PromptInfo):
+    async def get_text_response(self, prompt_info: PromptInfo) -> AgentRunResult[Any]:
         model = OpenAIChatModel(
             model_name="qwen/qwen2.5-vl-7b",
             provider=self._provider(),
         )
         agent = Agent(model)
         question = f'{prompt_info.user_name or "Unknown user"} asks: {prompt_info.user_message}'
-        agent_response = await agent.run(question)
+        return await agent.run(question)
 
-        await text_to_speech(agent_response.output)
+    async def process_prompt(self, prompt_info: PromptInfo):
+        agent_response = await self.get_text_response(prompt_info)
 
-
-
+        async for chunk in text_to_speech(agent_response.output):
+            yield chunk
