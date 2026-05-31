@@ -21,7 +21,7 @@ class PromptService:
 
     async def get_text_response(self, prompt_info: PromptInfo) -> AgentRunResult[Any]:
         model = OpenAIChatModel(
-            model_name="qwen/qwen2.5-vl-7b",
+            model_name="google/gemma-3-4b",
             provider=self._provider(),
         )
         agent = Agent(model)
