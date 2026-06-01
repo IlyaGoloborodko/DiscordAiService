@@ -17,7 +17,7 @@ async def text_to_speech(text: str) -> AsyncGenerator[bytes, None]:
     await client.write_event(
         Synthesize(
             text=text,
-            voice=SynthesizeVoice(name="ru_RU-dmitri-medium"),
+            voice=SynthesizeVoice(name="en_US-norman-medium"),
         ).event()
     )
 

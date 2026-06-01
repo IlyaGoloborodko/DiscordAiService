@@ -36,6 +36,7 @@ class PromptService:
         agent = Agent(
             model,
             output_type=MusicAgentOutput,
+            retries=5,
         )
         question = f'{prompt_info.user_name or "Unknown user"} asks: {prompt_info.user_message}'
         return await agent.run(question)
