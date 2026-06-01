@@ -5,7 +5,7 @@ from pydantic_ai import Agent, AgentRunResult
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from app.data.models import PromptInfo
+from app.data.models import PromptInfo, MusicAgentOutput
 from .tts_service import text_to_speech
 
 class PromptService:
@@ -25,6 +25,18 @@ class PromptService:
             provider=self._provider(),
         )
         agent = Agent(model)
+        question = f'{prompt_info.user_name or "Unknown user"} asks: {prompt_info.user_message}'
+        return await agent.run(question)
+
+    async def get_agent_response_with_search_str(self, prompt_info: PromptInfo) -> AgentRunResult[Any]:
+        model = OpenAIChatModel(
+            model_name="google/gemma-3-4b",
+            provider=self._provider(),
+        )
+        agent = Agent(
+            model,
+            output_type=MusicAgentOutput,
+        )
         question = f'{prompt_info.user_name or "Unknown user"} asks: {prompt_info.user_message}'
         return await agent.run(question)
 
