@@ -6,6 +6,7 @@ requires-python = ">=3.14"
 dependencies = [
     "asyncpg>=0.31.0",
     "fastapi>=0.136.3",
+    "httpx>=0.28.1",
     "mypy>=2.1.0",
     "numpy>=2.4.6",
     "pydantic-ai>=1.103.0",

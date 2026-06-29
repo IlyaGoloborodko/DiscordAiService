@@ -2,13 +2,14 @@ import uvicorn
 from fastapi import FastAPI
 from dotenv import load_dotenv
 
-from app.api import prompt_router, tts_router
+from app.api import prompt_router, tts_router, agent_router
 
 load_dotenv()
 app = FastAPI()
 
 app.include_router(prompt_router)
 app.include_router(tts_router)
+app.include_router(agent_router)
 
 
 if __name__ == "__main__":
