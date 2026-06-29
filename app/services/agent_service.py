@@ -6,6 +6,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from app.data.models import AgentRequest, AgentResponse, Track
+from app.services.memory import MemoryStore
 from app.services.search_client import SearchClient
 
 SYSTEM_PROMPT = """\
@@ -63,11 +64,29 @@ class AgentService:
 
         return agent
 
+    def __init__(self) -> None:
+        self.memory = MemoryStore()
+
     async def run(self, request: AgentRequest) -> AgentResponse:
         agent = self._build_agent()
         deps = AgentDeps(search=SearchClient())
-        result = await agent.run(self._format_prompt(request), deps=deps)
+
+        session_key = self._session_key(request)
+        history = await self.memory.load(session_key)
+
+        result = await agent.run(
+            self._format_prompt(request),
+            deps=deps,
+            message_history=history,
+        )
+
+        await self.memory.save(session_key, result.all_messages())
         return result.output
+
+    @staticmethod
+    def _session_key(request: AgentRequest) -> str:
+        session = request.session
+        return session.guild_id or session.user_id or "global"
 
     @staticmethod
     def _format_prompt(request: AgentRequest) -> str:
