@@ -24,3 +24,14 @@ class SearchClient:
             data = resp.json()
 
         return [Track(**entry) for entry in data.get("results", [])]
+
+    async def playlist(self, url: str, limit: int = 50, provider: str = "youtube") -> list[Track]:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(
+                f"{self.base_url}/playlist",
+                params={"url": url, "provider": provider, "limit": limit},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        return [Track(**entry) for entry in data.get("results", [])]

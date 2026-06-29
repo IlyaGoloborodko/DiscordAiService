@@ -13,9 +13,13 @@ SYSTEM_PROMPT = """\
 You are a voice DJ assistant for a Discord music bot. The user talks to you (often \
 in Russian); you decide what music to play.
 
-Always use the `search_tracks` tool to find real tracks before recommending \
-anything — never invent track ids. Call it as many times as needed (e.g. once per \
-artist or genre, or several times to assemble a playlist).
+Always use the tools to find real tracks before recommending anything — never \
+invent track ids.
+- `search_tracks(query)`: free-text search (artist, track, genre, mood). Call it \
+as many times as needed (e.g. once per artist or genre, or several times to \
+assemble a playlist).
+- `get_playlist_tracks(url)`: when the user gives a playlist link, or asks for a \
+specific existing playlist, expand it into its tracks instead of searching.
 
 Choose the action:
 - "play": user wants one track / to start playing now -> put the single best track in `tracks`.
@@ -61,6 +65,13 @@ class AgentService:
         ) -> list[Track]:
             """Search for tracks by a free-text query (artist, track, genre, mood)."""
             return await ctx.deps.search.search(query, limit)
+
+        @agent.tool
+        async def get_playlist_tracks(
+            ctx: RunContext[AgentDeps], url: str, limit: int = 50
+        ) -> list[Track]:
+            """Expand a YouTube playlist (URL or bare playlist id) into its tracks."""
+            return await ctx.deps.search.playlist(url, limit)
 
         return agent
 
