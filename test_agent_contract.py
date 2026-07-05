@@ -29,6 +29,53 @@ TOOLS = [
 ]
 
 
+class MemoryTrimTests(unittest.TestCase):
+    """History is kept to the last MAX_TURNS whole turns."""
+
+    @staticmethod
+    def _user(text):
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+        return ModelRequest(parts=[UserPromptPart(content=text)])
+
+    @staticmethod
+    def _assistant(text):
+        from pydantic_ai.messages import ModelResponse, TextPart
+        return ModelResponse(parts=[TextPart(content=text)])
+
+    def test_keeps_only_last_two_turns(self):
+        from app.services.memory import MemoryStore
+
+        msgs = [
+            self._user("t1"), self._assistant("a1"),
+            self._user("t2"), self._assistant("a2"),
+            self._user("t3"), self._assistant("a3"),
+        ]
+        trimmed = MemoryStore()._trim(msgs)
+        # last 2 turns -> starts at t2
+        self.assertEqual(len(trimmed), 4)
+        self.assertIs(trimmed[0], msgs[2])
+        self.assertIs(trimmed[-1], msgs[-1])
+
+    def test_short_history_untouched(self):
+        from app.services.memory import MemoryStore
+
+        msgs = [self._user("t1"), self._assistant("a1")]
+        self.assertEqual(MemoryStore()._trim(msgs), msgs)
+
+    def test_trimmed_history_starts_with_user_prompt(self):
+        from app.services.memory import MemoryStore
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+        msgs = []
+        for i in range(5):
+            msgs.append(self._user(f"t{i}"))
+            msgs.append(self._assistant(f"a{i}"))
+        trimmed = MemoryStore()._trim(msgs)
+        first = trimmed[0]
+        self.assertIsInstance(first, ModelRequest)
+        self.assertTrue(any(isinstance(p, UserPromptPart) for p in first.parts))
+
+
 class CleanForTtsTests(unittest.TestCase):
     def test_strips_emoji(self):
         cleaned = clean_for_tts("Paused. Ready when you are! ⏸️\U0001f3b6")

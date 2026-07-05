@@ -21,7 +21,12 @@ class MemoryStore:
     without memory."""
 
     TTL_SECONDS = 6 * 60 * 60
-    MAX_MESSAGES = 40
+    # Keep only the last few conversational turns. A "turn" starts at a user
+    # prompt and runs through its tool round-trips and final answer, so counting
+    # turns (not raw messages) keeps history small without ever cutting a turn in
+    # half and leaving a dangling tool-return. 2 turns ~= the last 4 user/assistant
+    # messages. Small on purpose: long history let stale answers poison the model.
+    MAX_TURNS = 2
 
     @staticmethod
     def _rkey(session_key: str) -> str:
@@ -50,17 +55,18 @@ class MemoryStore:
     # --- trimming ------------------------------------------------------------
 
     def _trim(self, messages: list[ModelMessage]) -> list[ModelMessage]:
-        """Bound history growth. Keep the last MAX_MESSAGES, then start at a user
-        prompt so we never hand the model a dangling tool-return."""
-        if len(messages) <= self.MAX_MESSAGES:
+        """Keep only the last MAX_TURNS turns. Cutting at a user-prompt boundary
+        keeps each turn whole (its tool round-trips stay paired) and guarantees
+        the history starts with a user prompt, never a dangling tool-return."""
+        turn_starts = [
+            idx
+            for idx, msg in enumerate(messages)
+            if isinstance(msg, ModelRequest)
+            and any(isinstance(part, UserPromptPart) for part in msg.parts)
+        ]
+        if len(turn_starts) <= self.MAX_TURNS:
             return messages
-        tail = messages[-self.MAX_MESSAGES:]
-        for idx, msg in enumerate(tail):
-            if isinstance(msg, ModelRequest) and any(
-                isinstance(part, UserPromptPart) for part in msg.parts
-            ):
-                return tail[idx:]
-        return tail
+        return messages[turn_starts[-self.MAX_TURNS]:]
 
     # --- redis ---------------------------------------------------------------
 
