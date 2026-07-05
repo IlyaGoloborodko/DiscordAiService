@@ -52,6 +52,19 @@ class MemoryStore:
         await self._cache_redis(session_key, raw)
         await self._save_pg(session_key, raw)
 
+    async def clear(self, session_key: str) -> None:
+        """Forget a session's history in both stores (best-effort)."""
+        try:
+            await get_redis().delete(self._rkey(session_key))
+        except Exception:
+            logger.warning("redis clear failed for %s", session_key, exc_info=True)
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM agent_sessions WHERE session_key = $1", session_key)
+        except Exception:
+            logger.warning("postgres clear failed for %s", session_key, exc_info=True)
+
     # --- trimming ------------------------------------------------------------
 
     def _trim(self, messages: list[ModelMessage]) -> list[ModelMessage]:

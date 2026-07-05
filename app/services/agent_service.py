@@ -10,6 +10,8 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from app.data.models import (
     AgentRequest,
     AgentResponse,
+    AgentSession,
+    ToolCall,
     ToolCallResponse,
     ToolSpec,
     Track,
@@ -66,6 +68,12 @@ of calling the action. You may add a clarifying question, but only TOGETHER with
 tool_call, never instead of one. If unsure about the genre, still call play/enqueue
 with a popular selection and offer to refine in the next message.
 
+Use ONLY the exact action names from the "Available actions" list below. Do NOT
+invent names — there is no "play_track", "search", or "play_music"; the search
+tools are separate and must never appear in tool_calls. For play/enqueue/
+replace_queue the `arguments.tracks` array MUST be non-empty (the tracks you found);
+an empty call plays nothing and is wrong.
+
 Rules:
 - To start or change music: first search for real tracks with the search tools, then
   emit ONE tool_call for the matching action, passing the found tracks in
@@ -118,9 +126,10 @@ def clean_for_tts(text: str) -> str:
 
 
 # Bump when the response contract changes so stale history from the old contract
-# is abandoned instead of poisoning the model as few-shot examples. Pre-v2 history
-# held English legacy answers with no tool_calls, which the model started copying.
-_MEMORY_VERSION = "v2"
+# is abandoned instead of poisoning the model as few-shot examples. v2 abandoned the
+# pre-tool English legacy answers; v3 abandons histories poisoned by hallucinated
+# action names (e.g. "play_track") emitted before server-side validation landed.
+_MEMORY_VERSION = "v3"
 
 
 @dataclass
@@ -237,11 +246,48 @@ class AgentService:
             message_history=history,
         )
 
-        await self.memory.save(session_key, result.all_messages())
-
         output = result.output
         output.spoken_answer = clean_for_tts(output.spoken_answer)
+
+        # In tool-calling mode the model can hallucinate action names (e.g.
+        # "play_track") or emit music actions with no tracks. Drop those before
+        # they reach the bot, and — crucially — only persist the turn when it was
+        # clean, so a bad answer can never seed (poison) the next turn's history.
+        clean = True
+        if isinstance(output, ToolCallResponse) and request.tools is not None:
+            output.tool_calls, dropped = self._validate_tool_calls(output.tool_calls, request.tools)
+            clean = dropped == 0
+
+        if clean:
+            await self.memory.save(session_key, result.all_messages())
+
         return output
+
+    @staticmethod
+    def _validate_tool_calls(
+        calls: list["ToolCall"], tools: list[ToolSpec]
+    ) -> tuple[list["ToolCall"], int]:
+        """Keep only calls that name a declared action; require non-empty `tracks`
+        for actions whose schema demands them. Returns (kept, dropped_count)."""
+        by_name = {tool.name: tool for tool in tools}
+        kept: list[ToolCall] = []
+        dropped = 0
+        for call in calls:
+            spec = by_name.get(call.name)
+            if spec is None:
+                dropped += 1
+                continue
+            if "tracks" in (spec.input_schema.get("required") or []):
+                tracks = call.arguments.get("tracks") if isinstance(call.arguments, dict) else None
+                if not tracks:
+                    dropped += 1
+                    continue
+            kept.append(call)
+        return kept, dropped
+
+    async def forget(self, session: AgentSession) -> None:
+        """Clear stored conversation memory for a session."""
+        await self.memory.clear(self._session_key(AgentRequest(session=session, message="")))
 
     @staticmethod
     def _session_key(request: AgentRequest) -> str:

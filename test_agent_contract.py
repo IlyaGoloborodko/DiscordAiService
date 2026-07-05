@@ -29,6 +29,70 @@ TOOLS = [
 ]
 
 
+class ValidateToolCallsTests(unittest.TestCase):
+    PLAY = ToolSpec(name="play", description="", input_schema={"required": ["tracks"], "properties": {"tracks": {}}})
+    PAUSE = ToolSpec(name="pause", description="", input_schema={"properties": {}})
+    DECLARED = [PLAY, PAUSE]
+
+    def test_drops_hallucinated_name(self):
+        calls = [ToolCall(name="play_track", arguments={})]
+        kept, dropped = AgentService._validate_tool_calls(calls, self.DECLARED)
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped, 1)
+
+    def test_drops_music_action_without_tracks(self):
+        calls = [ToolCall(name="play", arguments={})]
+        kept, dropped = AgentService._validate_tool_calls(calls, self.DECLARED)
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped, 1)
+
+    def test_keeps_play_with_tracks(self):
+        calls = [ToolCall(name="play", arguments={"tracks": [{"id": "x", "title": "t"}]})]
+        kept, dropped = AgentService._validate_tool_calls(calls, self.DECLARED)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(dropped, 0)
+
+    def test_keeps_control_with_empty_args(self):
+        calls = [ToolCall(name="pause", arguments={})]
+        kept, dropped = AgentService._validate_tool_calls(calls, self.DECLARED)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(dropped, 0)
+
+
+class DirtyTurnNotSavedTests(unittest.IsolatedAsyncioTestCase):
+    """A turn with a dropped (hallucinated) tool_call must not be persisted."""
+
+    async def asyncSetUp(self):
+        self.load = mock.patch("app.services.memory.MemoryStore.load",
+                               new=mock.AsyncMock(return_value=[]))
+        self.save = mock.patch("app.services.memory.MemoryStore.save", new=mock.AsyncMock())
+        self.load.start(); self.save.start()
+        self.addCleanup(self.load.stop); self.addCleanup(self.save.stop)
+
+    async def _run_with_output(self, output, tools):
+        svc = AgentService()
+        fake_agent = mock.Mock()
+        fake_agent.run = mock.AsyncMock(return_value=_FakeResult(output))
+        with mock.patch.dict(os.environ, _ENV), \
+             mock.patch.object(svc, "_build_toolcall_agent", return_value=fake_agent):
+            await svc.run(AgentRequest(message="play hardcore", tools=tools))
+        return svc.memory.save
+
+    async def test_dirty_turn_not_saved(self):
+        tools = [ToolSpec(name="play", input_schema={"required": ["tracks"]})]
+        out = ToolCallResponse(spoken_answer="ok", display_text="ok",
+                               tool_calls=[ToolCall(name="play_track", arguments={})])
+        save = await self._run_with_output(out, tools)
+        save.assert_not_called()
+
+    async def test_clean_turn_saved(self):
+        tools = [ToolSpec(name="play", input_schema={"required": ["tracks"]})]
+        out = ToolCallResponse(spoken_answer="ok", display_text="ok",
+                               tool_calls=[ToolCall(name="play", arguments={"tracks": [{"id": "a", "title": "b"}]})])
+        save = await self._run_with_output(out, tools)
+        save.assert_called_once()
+
+
 class MemoryTrimTests(unittest.TestCase):
     """History is kept to the last MAX_TURNS whole turns."""
 
