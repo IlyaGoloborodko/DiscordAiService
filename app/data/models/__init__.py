@@ -4,4 +4,12 @@ from .ai_response_models import MusicAgentOutput
 
 from .track import Track
 
-from .agent import AgentAction, AgentSession, AgentRequest, AgentResponse
+from .agent import (
+    AgentAction,
+    AgentSession,
+    AgentRequest,
+    AgentResponse,
+    ToolSpec,
+    ToolCall,
+    ToolCallResponse,
+)

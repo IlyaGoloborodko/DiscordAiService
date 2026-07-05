@@ -139,7 +139,7 @@ class ToolWiringSmokeTest(unittest.TestCase):
         from app.services.agent_service import AgentService
 
         with mock.patch.dict(os.environ, env):
-            agent = AgentService()._build_agent()
+            agent = AgentService()._build_legacy_agent()
 
         names = self._tool_names(agent)
         if names is None:

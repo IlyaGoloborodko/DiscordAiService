@@ -1,45 +1,126 @@
+import json
 import os
+import re
 from dataclasses import dataclass
 
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from app.data.models import AgentRequest, AgentResponse, Track
+from app.data.models import (
+    AgentRequest,
+    AgentResponse,
+    ToolCallResponse,
+    ToolSpec,
+    Track,
+)
 from app.services.memory import MemoryStore
 from app.services.search_client import SearchClient
 
-SYSTEM_PROMPT = """\
-You are a voice DJ assistant for a Discord music bot. The user talks to you (often \
-in Russian); you decide what music to play.
+# Shared persona + search-tool guidance, reused by both response modes.
+_PERSONA = """\
+You are Marina, a voice DJ assistant for a Discord music bot. The user talks to \
+you (often in Russian). The message may start by addressing you (Марина, Марин, \
+Маринка, Мариша, marina) — that is just how they call you, not part of the \
+command; ignore it as content.
+
+CRITICAL: `spoken_answer` is read aloud by an ENGLISH text-to-speech voice, so it \
+MUST always be written in English — even when the user speaks Russian. A Russian \
+`spoken_answer` comes out as garbled noise. `display_text` (chat only) may be in \
+the user's language.
 
 Always use the tools to find real tracks before recommending anything — never \
-invent track ids. Pick the most fitting tool for the request:
-- `search_tracks(query)`: an explicitly named track or artist to play, or plain \
-free-text search. Call it as many times as needed (e.g. once per artist or genre).
-- `get_playlist_tracks(url)`: the user gives a playlist link, or asks for a \
-specific existing playlist — expand it into its tracks instead of searching.
-- `get_similar_tracks(artist, track)`: "something new in the style of X", "like \
-X", "recommend me something" — pass the artist AND a representative seed track (a \
-well-known song by that artist); both are needed. Derive them from the user's \
-words or the current player state.
-- `get_top_charts(tag?, country?)`: "what's popular / trending / top", or "an hour \
-of <genre>/<mood>" — use `tag` for a genre or mood, `country` when the user names \
-one; omit both for the global top.
+invent track ids. Pick the most fitting tool:
+- `search_tracks(query)`: an explicitly named track or artist, or plain free-text search.
+- `get_playlist_tracks(url)`: the user gives a playlist link or asks for a specific playlist.
+- `get_similar_tracks(artist, track)`: "something like X" / "in the style of X" — \
+pass the artist AND a representative seed track; both are needed.
+- `get_top_charts(tag, country)`: "what's popular / trending" or "an hour of \
+<genre>/<mood>" — `tag` for a genre or mood, `country` when named; omit both for the global top.
+"""
 
-Charts and recommendations usually return several tracks -> prefer action "enqueue".
-
+# Legacy mode: the bot did NOT send tools, so we answer with action + tracks.
+LEGACY_PROMPT = _PERSONA + """
 Choose the action:
 - "play": user wants one track / to start playing now -> put the single best track in `tracks`.
 - "enqueue": user wants several tracks / a playlist / "an hour of music" -> put multiple tracks in `tracks`.
 - "replace_queue": user explicitly wants to replace what's playing with a new set.
-- "clarify": the request is too vague to act on -> set `clarification` with a short follow-up question, leave `tracks` empty.
+- "clarify": the request is too vague to act on -> set `clarification`, leave `tracks` empty.
 - "none": user isn't asking for music (small talk) -> just answer, leave `tracks` empty.
 
+Charts and recommendations usually return several tracks -> prefer action "enqueue".
 `tracks` must contain only items returned by the tools, with id/title/url unchanged.
-`spoken_answer`: short, natural, conversational ENGLISH sentence for text-to-speech (no JSON, ids or lists).
+`spoken_answer`: short, natural, conversational ENGLISH sentence for text-to-speech (plain text only — no emoji, markdown, JSON, ids or lists).
 `display_text`: short text for the Discord chat; titles and emoji are welcome.
 """
+
+# Tool-calling mode header; the concrete bot actions are appended per request.
+_TOOLCALL_RULES = """
+The bot exposes the ACTIONS listed below. To act, emit `tool_calls` — each item is
+{"name": <one of the action names>, "arguments": {...}}. Use ONLY these names.
+
+MANDATORY: if the user wants music (include/put on/start/play/add/enqueue/"something
+...", a genre, a mood, an artist), you MUST emit a play or enqueue (or the matching
+action) tool_call with real tracks you found. NEVER describe music in words instead
+of calling the action. You may add a clarifying question, but only TOGETHER with a
+tool_call, never instead of one. If unsure about the genre, still call play/enqueue
+with a popular selection and offer to refine in the next message.
+
+Rules:
+- To start or change music: first search for real tracks with the search tools, then
+  emit ONE tool_call for the matching action, passing the found tracks in
+  `arguments.tracks` as full objects (id, title, uploader, url, duration, provider).
+- For actions whose input schema is empty (e.g. pause/resume/skip/stop): emit the
+  tool_call with `arguments`: {}.
+- Questions about what's playing / what's in the queue / what's next: answer from the
+  current player state using spoken_answer + display_text and return an EMPTY
+  tool_calls list. Do NOT change the queue.
+- If no action is needed, return an empty tool_calls list.
+- One main action per turn is enough.
+
+spoken_answer: short, natural, conversational ENGLISH sentence (goes to an English TTS voice; plain text only — no emoji, markdown, ids or lists).
+display_text: short text for the Discord chat; emoji/markdown allowed.
+clarification: set only when you must ask a follow-up.
+
+Available actions:
+"""
+
+
+# TTS (Piper) chokes on emoji/markdown and falls back to reading them out
+# character-by-character. spoken_answer must be plain text, so we strip those
+# server-side rather than trust the model to obey the prompt.
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001f000-\U0001faff"  # symbols, emoticons, transport, supplemental
+    "\U00002600-\U000027bf"  # misc symbols + dingbats
+    "\U00002300-\U000023ff"  # misc technical (⏸ ⏯ ⏭ media controls)
+    "\U000025a0-\U000025ff"  # geometric shapes (▶ ◀ ■)
+    "\U00002190-\U000021ff"  # arrows
+    "\U00002b00-\U00002bff"  # misc symbols and arrows
+    "\U0001f1e6-\U0001f1ff"  # regional indicators (flags)
+    "\U0000fe00-\U0000fe0f"  # variation selectors
+    "\U00002139"             # information source (â„¹)
+    "\U000024c2"             # circled M
+    "]",
+    flags=re.UNICODE,
+)
+# Zero-width joiner and combining enclosing keycap used to build compound emoji.
+_ZWJ_RE = re.compile("[‍⃣]")
+_MARKDOWN_RE = re.compile(r"[*_`~#>|]+")
+
+
+def clean_for_tts(text: str) -> str:
+    """Strip emoji and markdown so the spoken text stays coherent for TTS."""
+    text = _EMOJI_RE.sub("", text)
+    text = _ZWJ_RE.sub("", text)
+    text = _MARKDOWN_RE.sub("", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+# Bump when the response contract changes so stale history from the old contract
+# is abandoned instead of poisoning the model as few-shot examples. Pre-v2 history
+# held English legacy answers with no tool_calls, which the model started copying.
+_MEMORY_VERSION = "v2"
 
 
 @dataclass
@@ -48,25 +129,27 @@ class AgentDeps:
 
 
 class AgentService:
-    """Builds and runs the music agent. The model/provider are read from env at
-    request time (env is loaded after import), matching the existing services."""
+    """Builds and runs the music agent. Dual-mode: when the request declares
+    `tools`, the agent returns bot tool_calls; otherwise it returns the legacy
+    action + tracks shape. The model/provider are read from env at request time
+    (env is loaded after import), matching the existing services."""
 
-    def _build_agent(self) -> Agent[AgentDeps, AgentResponse]:
-        model = OpenAIChatModel(
+    def __init__(self) -> None:
+        self.memory = MemoryStore()
+
+    # --- agent construction --------------------------------------------------
+
+    def _model(self) -> OpenAIChatModel:
+        return OpenAIChatModel(
             model_name=os.getenv("TM_MODEL_NAME"),
             provider=OpenAIProvider(
                 base_url=os.getenv("TM_BASE_URL"),
                 api_key=os.getenv("TM_API_KEY"),
             ),
         )
-        agent = Agent(
-            model,
-            output_type=AgentResponse,
-            deps_type=AgentDeps,
-            retries=5,
-            system_prompt=SYSTEM_PROMPT,
-        )
 
+    @staticmethod
+    def _register_search_tools(agent: Agent[AgentDeps, object]) -> None:
         @agent.tool
         async def search_tracks(
             ctx: RunContext[AgentDeps], query: str, limit: int = 10
@@ -90,7 +173,7 @@ class AgentService:
         ) -> list[Track]:
             """Recommend tracks in the style of an artist. Always pass a seed
             `track` too (a well-known song by that artist) — the recommendation
-            source needs both. Use for "something like X" / "more in this style"."""
+            source needs both."""
             return await ctx.deps.search.similar(artist, track, limit)
 
         @agent.tool
@@ -100,22 +183,53 @@ class AgentService:
             country: str | None = None,
             limit: int = 10,
         ) -> list[Track]:
-            """Popular/trending tracks. `tag` for a genre or mood (e.g. "rock",
-            "phonk", "chill"), `country` when the user names one; omit both for the
-            global top."""
+            """Popular/trending tracks. `tag` for a genre or mood, `country` when
+            the user names one; omit both for the global top."""
             return await ctx.deps.search.charts(tag, country, limit)
 
+    def _build_legacy_agent(self) -> Agent[AgentDeps, AgentResponse]:
+        agent = Agent(
+            self._model(),
+            output_type=AgentResponse,
+            deps_type=AgentDeps,
+            retries=5,
+            system_prompt=LEGACY_PROMPT,
+        )
+        self._register_search_tools(agent)
         return agent
 
-    def __init__(self) -> None:
-        self.memory = MemoryStore()
+    def _build_toolcall_agent(self, tools: list[ToolSpec]) -> Agent[AgentDeps, ToolCallResponse]:
+        agent = Agent(
+            self._model(),
+            output_type=ToolCallResponse,
+            deps_type=AgentDeps,
+            retries=5,
+            # Low temperature: we want reliable tool invocation, not creative prose.
+            model_settings={"temperature": 0.2},
+            system_prompt=_PERSONA + _TOOLCALL_RULES + self._render_tools(tools),
+        )
+        self._register_search_tools(agent)
+        return agent
 
-    async def run(self, request: AgentRequest) -> AgentResponse:
-        agent = self._build_agent()
+    @staticmethod
+    def _render_tools(tools: list[ToolSpec]) -> str:
+        lines = []
+        for tool in tools:
+            schema = json.dumps(tool.input_schema, ensure_ascii=False) if tool.input_schema else "{}"
+            lines.append(f"- {tool.name}: {tool.description} | arguments schema: {schema}")
+        return "\n".join(lines)
+
+    # --- run -----------------------------------------------------------------
+
+    async def run(self, request: AgentRequest) -> AgentResponse | ToolCallResponse:
         deps = AgentDeps(search=SearchClient())
-
         session_key = self._session_key(request)
         history = await self.memory.load(session_key)
+
+        if request.tools:
+            agent: Agent[AgentDeps, object] = self._build_toolcall_agent(request.tools)
+        else:
+            agent = self._build_legacy_agent()
 
         result = await agent.run(
             self._format_prompt(request),
@@ -124,17 +238,34 @@ class AgentService:
         )
 
         await self.memory.save(session_key, result.all_messages())
-        return result.output
+
+        output = result.output
+        output.spoken_answer = clean_for_tts(output.spoken_answer)
+        return output
 
     @staticmethod
     def _session_key(request: AgentRequest) -> str:
         session = request.session
-        return session.guild_id or session.user_id or "global"
+        base = session.guild_id or session.user_id or "global"
+        return f"{_MEMORY_VERSION}:{base}"
 
     @staticmethod
     def _format_prompt(request: AgentRequest) -> str:
         who = request.session.user_name or "Unknown user"
         prompt = f"{who} says: {request.message}"
-        if request.context:
-            prompt += f"\n\nCurrent player state: {request.context}"
+
+        ctx = request.context or {}
+        parts: list[str] = []
+        if ctx.get("now_playing"):
+            parts.append(f"Now playing: {ctx['now_playing']}")
+        queue = ctx.get("queue")
+        if queue:
+            parts.append("Queue: " + "; ".join(str(item) for item in queue))
+        elif ctx.get("queue_len") is not None:
+            parts.append(f"Queue length: {ctx['queue_len']}")
+        if not parts and ctx:
+            parts.append(f"Player state: {ctx}")
+
+        if parts:
+            prompt += "\n\nCurrent player state:\n" + "\n".join(parts)
         return prompt
