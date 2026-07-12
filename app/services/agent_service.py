@@ -3,15 +3,19 @@ import os
 import re
 from dataclasses import dataclass
 
+import emoji
+
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from app.data.models import (
+    AgentDraft,
     AgentRequest,
     AgentResponse,
     AgentSession,
     ToolCall,
+    ToolCallDraft,
     ToolCallResponse,
     ToolSpec,
     Track,
@@ -26,10 +30,12 @@ you (often in Russian). The message may start by addressing you (Марина, �
 Маринка, Мариша, marina) — that is just how they call you, not part of the \
 command; ignore it as content.
 
-CRITICAL: `spoken_answer` is read aloud by an ENGLISH text-to-speech voice, so it \
-MUST always be written in English — even when the user speaks Russian. A Russian \
-`spoken_answer` comes out as garbled noise. `display_text` (chat only) may be in \
-the user's language.
+Write ONE reply in `display_text`. It is shown in the chat as-is AND, after the \
+service strips emoji/markdown, is read aloud by the text-to-speech voice. The TTS \
+voice is ENGLISH, so `display_text` MUST be written in English — even when the user \
+speaks Russian (Russian would come out as garbled noise). Keep it short, natural \
+and conversational; a few emoji are fine (they are removed before speech). Do NOT \
+produce a separate spoken field — the service derives it from `display_text`.
 
 Always use the tools to find real tracks before recommending anything — never \
 invent track ids. Pick the most fitting tool:
@@ -52,8 +58,7 @@ Choose the action:
 
 Charts and recommendations usually return several tracks -> prefer action "enqueue".
 `tracks` must contain only items returned by the tools, with id/title/url unchanged.
-`spoken_answer`: short, natural, conversational ENGLISH sentence for text-to-speech (plain text only — no emoji, markdown, JSON, ids or lists).
-`display_text`: short text for the Discord chat; titles and emoji are welcome.
+`display_text`: your single reply (English; emoji/markdown allowed — stripped for speech).
 """
 
 # Tool-calling mode header; the concrete bot actions are appended per request.
@@ -81,13 +86,12 @@ Rules:
 - For actions whose input schema is empty (e.g. pause/resume/skip/stop): emit the
   tool_call with `arguments`: {}.
 - Questions about what's playing / what's in the queue / what's next: answer from the
-  current player state using spoken_answer + display_text and return an EMPTY
-  tool_calls list. Do NOT change the queue.
+  current player state in `display_text` and return an EMPTY tool_calls list. Do NOT
+  change the queue.
 - If no action is needed, return an empty tool_calls list.
 - One main action per turn is enough.
 
-spoken_answer: short, natural, conversational ENGLISH sentence (goes to an English TTS voice; plain text only — no emoji, markdown, ids or lists).
-display_text: short text for the Discord chat; emoji/markdown allowed.
+display_text: your single reply (English; emoji/markdown allowed — stripped for speech).
 clarification: set only when you must ask a follow-up.
 
 Available actions:
@@ -96,31 +100,20 @@ Available actions:
 
 # TTS (Piper) chokes on emoji/markdown and falls back to reading them out
 # character-by-character. spoken_answer must be plain text, so we strip those
-# server-side rather than trust the model to obey the prompt.
-_EMOJI_RE = re.compile(
-    "["
-    "\U0001f000-\U0001faff"  # symbols, emoticons, transport, supplemental
-    "\U00002600-\U000027bf"  # misc symbols + dingbats
-    "\U00002300-\U000023ff"  # misc technical (⏸ ⏯ ⏭ media controls)
-    "\U000025a0-\U000025ff"  # geometric shapes (▶ ◀ ■)
-    "\U00002190-\U000021ff"  # arrows
-    "\U00002b00-\U00002bff"  # misc symbols and arrows
-    "\U0001f1e6-\U0001f1ff"  # regional indicators (flags)
-    "\U0000fe00-\U0000fe0f"  # variation selectors
-    "\U00002139"             # information source (â„¹)
-    "\U000024c2"             # circled M
-    "]",
-    flags=re.UNICODE,
-)
-# Zero-width joiner and combining enclosing keycap used to build compound emoji.
-_ZWJ_RE = re.compile("[‍⃣]")
+# server-side rather than trust the model to obey the prompt. Emoji removal uses
+# the `emoji` library (full, maintained Unicode emoji data) instead of hand-rolled
+# ranges, which kept missing symbols (™, ‼, CJK marks, ...).
 _MARKDOWN_RE = re.compile(r"[*_`~#>|]+")
+# A few decorative symbols that are NOT emoji per the Unicode spec (so the emoji
+# library leaves them) but that TTS mispronounces. Kept as an explicit tiny set,
+# not ranges — musical notes are likely in a music bot's replies.
+_EXTRA_SYMBOLS_RE = re.compile("[♪♫♬♩★☆]")
 
 
 def clean_for_tts(text: str) -> str:
     """Strip emoji and markdown so the spoken text stays coherent for TTS."""
-    text = _EMOJI_RE.sub("", text)
-    text = _ZWJ_RE.sub("", text)
+    text = emoji.replace_emoji(text, "")
+    text = _EXTRA_SYMBOLS_RE.sub("", text)
     text = _MARKDOWN_RE.sub("", text)
     return re.sub(r"\s{2,}", " ", text).strip()
 
@@ -196,10 +189,10 @@ class AgentService:
             the user names one; omit both for the global top."""
             return await ctx.deps.search.charts(tag, country, limit)
 
-    def _build_legacy_agent(self) -> Agent[AgentDeps, AgentResponse]:
+    def _build_legacy_agent(self) -> Agent[AgentDeps, AgentDraft]:
         agent = Agent(
             self._model(),
-            output_type=AgentResponse,
+            output_type=AgentDraft,
             deps_type=AgentDeps,
             retries=5,
             system_prompt=LEGACY_PROMPT,
@@ -207,10 +200,10 @@ class AgentService:
         self._register_search_tools(agent)
         return agent
 
-    def _build_toolcall_agent(self, tools: list[ToolSpec]) -> Agent[AgentDeps, ToolCallResponse]:
+    def _build_toolcall_agent(self, tools: list[ToolSpec]) -> Agent[AgentDeps, ToolCallDraft]:
         agent = Agent(
             self._model(),
-            output_type=ToolCallResponse,
+            output_type=ToolCallDraft,
             deps_type=AgentDeps,
             retries=5,
             # Low temperature: we want reliable tool invocation, not creative prose.
@@ -246,22 +239,38 @@ class AgentService:
             message_history=history,
         )
 
-        output = result.output
-        output.spoken_answer = clean_for_tts(output.spoken_answer)
+        draft = result.output
+        # The model writes one reply (display_text); we derive the spoken form by
+        # stripping emoji/markdown, so the two never diverge in meaning.
+        spoken = clean_for_tts(draft.display_text)
 
-        # In tool-calling mode the model can hallucinate action names (e.g.
-        # "play_track") or emit music actions with no tracks. Drop those before
-        # they reach the bot, and — crucially — only persist the turn when it was
-        # clean, so a bad answer can never seed (poison) the next turn's history.
         clean = True
-        if isinstance(output, ToolCallResponse) and request.tools is not None:
-            output.tool_calls, dropped = self._validate_tool_calls(output.tool_calls, request.tools)
+        if isinstance(draft, ToolCallDraft) and request.tools is not None:
+            # The model can hallucinate action names ("play_track") or emit music
+            # actions with no tracks. Drop those before they reach the bot, and only
+            # persist the turn when it was clean, so a bad answer can never poison
+            # the next turn's history.
+            tool_calls, dropped = self._validate_tool_calls(draft.tool_calls, request.tools)
             clean = dropped == 0
+            response: AgentResponse | ToolCallResponse = ToolCallResponse(
+                spoken_answer=spoken,
+                display_text=draft.display_text,
+                clarification=draft.clarification,
+                tool_calls=tool_calls,
+            )
+        else:
+            response = AgentResponse(
+                spoken_answer=spoken,
+                display_text=draft.display_text,
+                action=draft.action,
+                tracks=draft.tracks,
+                clarification=draft.clarification,
+            )
 
         if clean:
             await self.memory.save(session_key, result.all_messages())
 
-        return output
+        return response
 
     @staticmethod
     def _validate_tool_calls(

@@ -50,11 +50,11 @@ class ToolCall(BaseModel):
     )
 
 
-class ToolCallResponse(BaseModel):
-    """Response when the request declared `tools`: the bot executes `tool_calls`."""
+class ToolCallDraft(BaseModel):
+    """What the LLM generates in tool-calling mode. It writes a single reply in
+    `display_text`; the service derives `spoken_answer` from it (cleaned)."""
 
-    spoken_answer: str = Field(description="Short, natural, conversational sentence for TTS. No markdown.")
-    display_text: str = Field(description="Short text for the Discord chat; emoji/markdown allowed.")
+    display_text: str = Field(description="The single reply. Goes to the chat as-is and, cleaned, to TTS.")
     clarification: str | None = Field(default=None, description="A follow-up question if one is needed.")
     tool_calls: list[ToolCall] = Field(
         default_factory=list,
@@ -62,19 +62,32 @@ class ToolCallResponse(BaseModel):
     )
 
 
-class AgentResponse(BaseModel):
-    """Legacy response when the request did NOT declare `tools`."""
+class ToolCallResponse(BaseModel):
+    """Response to the bot when the request declared `tools`."""
 
-    spoken_answer: str = Field(
-        description="Short, natural, conversational English sentence for TTS. No JSON, ids or lists."
-    )
-    display_text: str = Field(description="Short text for the Discord chat; may include titles/emoji.")
+    spoken_answer: str = Field(description="display_text cleaned of emoji/markdown for TTS. Set by the service.")
+    display_text: str = Field(description="The assistant reply for the Discord chat; emoji/markdown allowed.")
+    clarification: str | None = None
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+
+
+class AgentDraft(BaseModel):
+    """What the LLM generates in legacy mode; `spoken_answer` is derived, not generated."""
+
+    display_text: str = Field(description="The single reply. Goes to the chat as-is and, cleaned, to TTS.")
     action: AgentAction = Field(description="What the bot should do with `tracks`.")
     tracks: list[Track] = Field(
         default_factory=list,
         description="Tracks to act on, taken verbatim from search results.",
     )
-    clarification: str | None = Field(
-        default=None,
-        description="A follow-up question when action == 'clarify'.",
-    )
+    clarification: str | None = Field(default=None, description="A follow-up question when action == 'clarify'.")
+
+
+class AgentResponse(BaseModel):
+    """Legacy response when the request did NOT declare `tools`."""
+
+    spoken_answer: str = Field(description="display_text cleaned of emoji/markdown for TTS. Set by the service.")
+    display_text: str = Field(description="The assistant reply for the Discord chat; may include titles/emoji.")
+    action: AgentAction = Field(description="What the bot should do with `tracks`.")
+    tracks: list[Track] = Field(default_factory=list)
+    clarification: str | None = None

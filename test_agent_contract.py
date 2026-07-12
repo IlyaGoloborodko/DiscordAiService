@@ -11,9 +11,11 @@ import unittest
 from unittest import mock
 
 from app.data.models import (
+    AgentDraft,
     AgentRequest,
     AgentResponse,
     ToolCall,
+    ToolCallDraft,
     ToolCallResponse,
     ToolSpec,
 )
@@ -80,15 +82,15 @@ class DirtyTurnNotSavedTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dirty_turn_not_saved(self):
         tools = [ToolSpec(name="play", input_schema={"required": ["tracks"]})]
-        out = ToolCallResponse(spoken_answer="ok", display_text="ok",
-                               tool_calls=[ToolCall(name="play_track", arguments={})])
+        out = ToolCallDraft(display_text="ok",
+                            tool_calls=[ToolCall(name="play_track", arguments={})])
         save = await self._run_with_output(out, tools)
         save.assert_not_called()
 
     async def test_clean_turn_saved(self):
         tools = [ToolSpec(name="play", input_schema={"required": ["tracks"]})]
-        out = ToolCallResponse(spoken_answer="ok", display_text="ok",
-                               tool_calls=[ToolCall(name="play", arguments={"tracks": [{"id": "a", "title": "b"}]})])
+        out = ToolCallDraft(display_text="ok",
+                            tool_calls=[ToolCall(name="play", arguments={"tracks": [{"id": "a", "title": "b"}]})])
         save = await self._run_with_output(out, tools)
         save.assert_called_once()
 
@@ -161,6 +163,21 @@ class CleanForTtsTests(unittest.TestCase):
         cleaned = clean_for_tts("mix \U0001f3a4\U0001f496\U0001f601\U0001f1ea\U0001f1f8 done")
         self.assertTrue(all(ord(ch) < 0x2000 or ch.isspace() for ch in cleaned), cleaned)
 
+    def test_users_live_example(self):
+        cleaned = clean_for_tts(
+            "Hey! \U0001f44b Ready to find some music for you. What are we listening to today? \U0001f3a7"
+        )
+        self.assertEqual(cleaned, "Hey! Ready to find some music for you. What are we listening to today?")
+
+    def test_strips_symbols_the_ranges_used_to_miss(self):
+        # ™ ‼ ⁉ CJK marks — not caught by the old hand-rolled ranges.
+        self.assertEqual(clean_for_tts("Great pick ©®™ enjoy"), "Great pick enjoy")
+        self.assertEqual(clean_for_tts("Wow‼ really⁉"), "Wow really")
+        self.assertEqual(clean_for_tts("nice 〰 ㊗ ㊙"), "nice")
+
+    def test_strips_musical_notes(self):
+        self.assertEqual(clean_for_tts("la la ♪ ♫ ♬ now"), "la la now")
+
 
 class RenderAndPromptTests(unittest.TestCase):
     def test_render_tools_lists_names_and_schema(self):
@@ -210,12 +227,12 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tools_present_uses_toolcall_agent(self):
         svc = AgentService()
-        expected = ToolCallResponse(
-            spoken_answer="ok", display_text="ok",
-            tool_calls=[ToolCall(name="enqueue", arguments={"tracks": []})],
+        draft = ToolCallDraft(
+            display_text="ok",
+            tool_calls=[ToolCall(name="enqueue", arguments={"tracks": [{"id": "a", "title": "b"}]})],
         )
         fake_agent = mock.Mock()
-        fake_agent.run = mock.AsyncMock(return_value=_FakeResult(expected))
+        fake_agent.run = mock.AsyncMock(return_value=_FakeResult(draft))
 
         with mock.patch.dict(os.environ, _ENV), \
              mock.patch.object(svc, "_build_toolcall_agent", return_value=fake_agent) as build_tc, \
@@ -227,14 +244,13 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         build_legacy.assert_not_called()
         self.assertIsInstance(out, ToolCallResponse)
         self.assertEqual(out.tool_calls[0].name, "enqueue")
+        self.assertEqual(out.spoken_answer, "ok")  # derived from display_text
 
     async def test_no_tools_uses_legacy_agent(self):
         svc = AgentService()
-        expected = AgentResponse(
-            spoken_answer="ok", display_text="ok", action="play", tracks=[],
-        )
+        draft = AgentDraft(display_text="ok 🎵", action="play", tracks=[])
         fake_agent = mock.Mock()
-        fake_agent.run = mock.AsyncMock(return_value=_FakeResult(expected))
+        fake_agent.run = mock.AsyncMock(return_value=_FakeResult(draft))
 
         with mock.patch.dict(os.environ, _ENV), \
              mock.patch.object(svc, "_build_legacy_agent", return_value=fake_agent) as build_legacy, \
@@ -246,6 +262,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         build_tc.assert_not_called()
         self.assertIsInstance(out, AgentResponse)
         self.assertEqual(out.action, "play")
+        self.assertEqual(out.spoken_answer, "ok")  # emoji stripped from display_text
 
 
 class ToolCallAgentBuildTest(unittest.TestCase):
