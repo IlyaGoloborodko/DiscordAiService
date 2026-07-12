@@ -1,33 +1,64 @@
-import asyncio
 import os
+from datetime import datetime
+from typing import Any
 
-import asyncpg
-
-_pool: asyncpg.Pool | None = None
-_lock = asyncio.Lock()
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS agent_sessions (
-    session_key TEXT PRIMARY KEY,
-    messages    JSONB NOT NULL,
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-"""
+from sqlalchemy import TIMESTAMP, Text, func
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
-async def get_pool() -> asyncpg.Pool:
-    """Lazily create a process-wide asyncpg pool and ensure the schema exists.
-    Double-checked under a lock so concurrent first requests create it once."""
-    global _pool
-    if _pool is None:
-        async with _lock:
-            if _pool is None:
-                pool = await asyncpg.create_pool(
-                    dsn=os.getenv("POSTGRES_DSN"),
-                    min_size=1,
-                    max_size=5,
-                )
-                async with pool.acquire() as conn:
-                    await conn.execute(_SCHEMA)
-                _pool = pool
-    return _pool
+class Base(DeclarativeBase):
+    """Declarative base; Alembic reads Base.metadata for migrations."""
+
+
+class SessionMemory(Base):
+    """Serialized pydantic-ai conversation history, one row per session key."""
+
+    __tablename__ = "agent_sessions"
+
+    session_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    messages: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+def async_dsn() -> str:
+    """Normalise POSTGRES_DSN to the asyncpg driver SQLAlchemy expects."""
+    dsn = os.getenv("POSTGRES_DSN", "")
+    for prefix in ("postgresql+asyncpg://", ):
+        if dsn.startswith(prefix):
+            return dsn
+    if dsn.startswith("postgresql://"):
+        return "postgresql+asyncpg://" + dsn[len("postgresql://"):]
+    if dsn.startswith("postgres://"):
+        return "postgresql+asyncpg://" + dsn[len("postgres://"):]
+    return dsn
+
+
+_engine: AsyncEngine | None = None
+_sessionmaker: async_sessionmaker[AsyncSession] | None = None
+
+
+def get_engine() -> AsyncEngine:
+    """Lazily create a process-wide async engine (connection pool inside)."""
+    global _engine
+    if _engine is None:
+        _engine = create_async_engine(async_dsn(), pool_size=5, max_overflow=5, pool_pre_ping=True)
+    return _engine
+
+
+def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
+    global _sessionmaker
+    if _sessionmaker is None:
+        _sessionmaker = async_sessionmaker(get_engine(), expire_on_commit=False)
+    return _sessionmaker
