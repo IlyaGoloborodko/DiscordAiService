@@ -15,6 +15,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "redis>=5.2.1",
     "ruff>=0.15.14",
+    "tiktoken>=0.8.0",
     "sqlalchemy[asyncio]>=2.0.43",
     "sounddevice>=0.5.5",
     "uvicorn>=0.48.0",

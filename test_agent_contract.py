@@ -96,7 +96,8 @@ class DirtyTurnNotSavedTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MemoryTrimTests(unittest.TestCase):
-    """History is kept to the last MAX_TURNS whole turns."""
+    """Intermediate history is bounded by a token budget; system prompt and the
+    latest message are handled elsewhere and never part of this."""
 
     @staticmethod
     def _user(text):
@@ -108,38 +109,59 @@ class MemoryTrimTests(unittest.TestCase):
         from pydantic_ai.messages import ModelResponse, TextPart
         return ModelResponse(parts=[TextPart(content=text)])
 
-    def test_keeps_only_last_two_turns(self):
-        from app.services.memory import MemoryStore
-
-        msgs = [
-            self._user("t1"), self._assistant("a1"),
-            self._user("t2"), self._assistant("a2"),
-            self._user("t3"), self._assistant("a3"),
-        ]
-        trimmed = MemoryStore()._trim(msgs)
-        # last 2 turns -> starts at t2
-        self.assertEqual(len(trimmed), 4)
-        self.assertIs(trimmed[0], msgs[2])
-        self.assertIs(trimmed[-1], msgs[-1])
+    def _msgs(self, n):
+        out = []
+        for i in range(n):
+            out.append(self._user(f"user message number {i}"))
+            out.append(self._assistant(f"assistant reply number {i}"))
+        return out
 
     def test_short_history_untouched(self):
         from app.services.memory import MemoryStore
 
-        msgs = [self._user("t1"), self._assistant("a1")]
-        self.assertEqual(MemoryStore()._trim(msgs), msgs)
+        msgs = self._msgs(2)
+        self.assertEqual(MemoryStore()._trim(msgs), msgs)  # well under 20k tokens
+
+    def test_drops_oldest_when_over_budget(self):
+        from app.services.memory import MemoryStore
+
+        store = MemoryStore()
+        msgs = self._msgs(10)  # 20 messages
+        # Budget for roughly the last 6 messages.
+        store.token_limit = store._count_tokens(msgs[-1]) * 6
+        trimmed = store._trim(msgs)
+        self.assertLess(len(trimmed), len(msgs))
+        self.assertGreater(len(trimmed), 0)
+        self.assertIs(trimmed[-1], msgs[-1])  # newest always kept
 
     def test_trimmed_history_starts_with_user_prompt(self):
         from app.services.memory import MemoryStore
         from pydantic_ai.messages import ModelRequest, UserPromptPart
 
-        msgs = []
-        for i in range(5):
-            msgs.append(self._user(f"t{i}"))
-            msgs.append(self._assistant(f"a{i}"))
-        trimmed = MemoryStore()._trim(msgs)
+        store = MemoryStore()
+        msgs = self._msgs(10)
+        store.token_limit = store._count_tokens(msgs[-1]) * 6
+        trimmed = store._trim(msgs)
         first = trimmed[0]
         self.assertIsInstance(first, ModelRequest)
         self.assertTrue(any(isinstance(p, UserPromptPart) for p in first.parts))
+
+    def test_strip_system_removes_system_parts(self):
+        from app.services.memory import MemoryStore
+        from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
+
+        msgs = [
+            ModelRequest(parts=[SystemPromptPart(content="SYS")]),
+            ModelRequest(parts=[SystemPromptPart(content="SYS"), UserPromptPart(content="hi")]),
+            self._assistant("a"),
+        ]
+        stripped = MemoryStore._strip_system(msgs)
+        # the system-only request is dropped; the mixed one keeps just the user part
+        self.assertEqual(len(stripped), 2)
+        self.assertFalse(
+            any(isinstance(p, SystemPromptPart) for m in stripped
+                if isinstance(m, ModelRequest) for p in m.parts)
+        )
 
 
 class CleanForTtsTests(unittest.TestCase):
@@ -240,7 +262,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             req = AgentRequest(message="Марина, поставь бодрое", tools=TOOLS)
             out = await svc.run(req)
 
-        build_tc.assert_called_once_with(TOOLS)
+        build_tc.assert_called_once_with()
         build_legacy.assert_not_called()
         self.assertIsInstance(out, ToolCallResponse)
         self.assertEqual(out.tool_calls[0].name, "enqueue")
@@ -265,12 +287,24 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out.spoken_answer, "ok")  # emoji stripped from display_text
 
 
-class ToolCallAgentBuildTest(unittest.TestCase):
-    """The toolcall agent must build and embed the bot actions in its prompt."""
+class SystemTextTest(unittest.TestCase):
+    """The system prompt (built per request) must embed the bot actions and the
+    toolcall agent must build without error."""
 
-    def test_build_toolcall_agent_embeds_actions(self):
+    def test_toolcall_system_text_lists_actions(self):
+        req = AgentRequest(message="hi", tools=TOOLS)
+        text = AgentService()._system_text(req)
+        self.assertIn("- play:", text)
+        self.assertIn("- pause:", text)
+
+    def test_legacy_system_text_without_tools(self):
+        req = AgentRequest(message="hi")
+        text = AgentService()._system_text(req)
+        self.assertNotIn("Available actions", text)
+
+    def test_build_toolcall_agent(self):
         with mock.patch.dict(os.environ, _ENV):
-            agent = AgentService()._build_toolcall_agent(TOOLS)
+            agent = AgentService()._build_toolcall_agent()
         self.assertIsNotNone(agent)
 
 

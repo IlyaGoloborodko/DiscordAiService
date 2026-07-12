@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import emoji
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import ModelRequest, SystemPromptPart
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -189,18 +190,20 @@ class AgentService:
             the user names one; omit both for the global top."""
             return await ctx.deps.search.charts(tag, country, limit)
 
+    # The system prompt is injected fresh into message_history each run (see run),
+    # not set on the Agent — so it can never be lost when memory trims history and
+    # is always the current version.
     def _build_legacy_agent(self) -> Agent[AgentDeps, AgentDraft]:
         agent = Agent(
             self._model(),
             output_type=AgentDraft,
             deps_type=AgentDeps,
             retries=5,
-            system_prompt=LEGACY_PROMPT,
         )
         self._register_search_tools(agent)
         return agent
 
-    def _build_toolcall_agent(self, tools: list[ToolSpec]) -> Agent[AgentDeps, ToolCallDraft]:
+    def _build_toolcall_agent(self) -> Agent[AgentDeps, ToolCallDraft]:
         agent = Agent(
             self._model(),
             output_type=ToolCallDraft,
@@ -208,10 +211,14 @@ class AgentService:
             retries=5,
             # Low temperature: we want reliable tool invocation, not creative prose.
             model_settings={"temperature": 0.2},
-            system_prompt=_PERSONA + _TOOLCALL_RULES + self._render_tools(tools),
         )
         self._register_search_tools(agent)
         return agent
+
+    def _system_text(self, request: AgentRequest) -> str:
+        if request.tools:
+            return _PERSONA + _TOOLCALL_RULES + self._render_tools(request.tools)
+        return LEGACY_PROMPT
 
     @staticmethod
     def _render_tools(tools: list[ToolSpec]) -> str:
@@ -226,12 +233,18 @@ class AgentService:
     async def run(self, request: AgentRequest) -> AgentResponse | ToolCallResponse:
         deps = AgentDeps(search=SearchClient())
         session_key = self._session_key(request)
-        history = await self.memory.load(session_key)
+        intermediate = await self.memory.load(session_key)
 
         if request.tools:
-            agent: Agent[AgentDeps, object] = self._build_toolcall_agent(request.tools)
+            agent: Agent[AgentDeps, object] = self._build_toolcall_agent()
         else:
             agent = self._build_legacy_agent()
+
+        # Prepend the current system prompt so it is always present, regardless of
+        # how the intermediate history was trimmed. pydantic-ai does not re-add a
+        # system prompt when message_history is non-empty, so we own it here.
+        system = ModelRequest(parts=[SystemPromptPart(content=self._system_text(request))])
+        history = [system, *intermediate]
 
         result = await agent.run(
             self._format_prompt(request),

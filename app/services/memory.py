@@ -1,11 +1,14 @@
 import json
 import logging
+import os
 from typing import Any
 
+import tiktoken
 from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
     ModelRequest,
+    SystemPromptPart,
     UserPromptPart,
 )
 from sqlalchemy import delete, func
@@ -14,6 +17,18 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.storage import SessionMemory, get_redis, get_sessionmaker
 
 logger = logging.getLogger(__name__)
+
+# A widely-used encoding; the exact model tokenizer isn't critical here — we only
+# need a stable, reasonable estimate to budget history size.
+HISTORY_ENCODING = "cl100k_base"
+_encoder: tiktoken.Encoding | None = None
+
+
+def _get_encoder() -> tiktoken.Encoding:
+    global _encoder
+    if _encoder is None:
+        _encoder = tiktoken.get_encoding(HISTORY_ENCODING)
+    return _encoder
 
 
 class MemoryStore:
@@ -25,12 +40,12 @@ class MemoryStore:
     just without memory."""
 
     TTL_SECONDS = 6 * 60 * 60
-    # Keep only the last few conversational turns. A "turn" starts at a user
-    # prompt and runs through its tool round-trips and final answer, so counting
-    # turns (not raw messages) keeps history small without ever cutting a turn in
-    # half and leaving a dangling tool-return. 2 turns ~= the last 4 user/assistant
-    # messages. Small on purpose: long history let stale answers poison the model.
-    MAX_TURNS = 2
+
+    def __init__(self) -> None:
+        # Token budget for the INTERMEDIATE history only. The system prompt (added
+        # fresh by the agent) and the latest user message are never part of this
+        # and are never trimmed.
+        self.token_limit = int(os.getenv("HISTORY_TOKEN_LIMIT", "20000"))
 
     @staticmethod
     def _rkey(session_key: str) -> str:
@@ -49,7 +64,9 @@ class MemoryStore:
         return self._decode(payload, session_key)
 
     async def save(self, session_key: str, messages: list[ModelMessage]) -> None:
-        trimmed = self._trim(messages)
+        # Strip system prompts: the agent injects the current one fresh each run,
+        # so persisting it would only let a stale copy accumulate.
+        trimmed = self._trim(self._strip_system(messages))
         raw = ModelMessagesTypeAdapter.dump_json(trimmed)
         payload = json.loads(raw)  # JSON-native structure for the JSONB column
         await self._cache_redis(session_key, raw)
@@ -84,19 +101,45 @@ class MemoryStore:
 
     # --- trimming ------------------------------------------------------------
 
+    @staticmethod
+    def _strip_system(messages: list[ModelMessage]) -> list[ModelMessage]:
+        """Drop SystemPromptParts (and any request left empty by that)."""
+        out: list[ModelMessage] = []
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                parts = [p for p in msg.parts if not isinstance(p, SystemPromptPart)]
+                if not parts:
+                    continue
+                if len(parts) != len(msg.parts):
+                    msg = ModelRequest(parts=parts)
+            out.append(msg)
+        return out
+
     def _trim(self, messages: list[ModelMessage]) -> list[ModelMessage]:
-        """Keep only the last MAX_TURNS turns. Cutting at a user-prompt boundary
-        keeps each turn whole (its tool round-trips stay paired) and guarantees
-        the history starts with a user prompt, never a dangling tool-return."""
-        turn_starts = [
-            idx
-            for idx, msg in enumerate(messages)
-            if isinstance(msg, ModelRequest)
-            and any(isinstance(part, UserPromptPart) for part in msg.parts)
-        ]
-        if len(turn_starts) <= self.MAX_TURNS:
-            return messages
-        return messages[turn_starts[-self.MAX_TURNS]:]
+        """Keep the newest messages that fit within the token budget, dropping
+        whole messages that don't. Then align the start to a user prompt so the
+        history never begins with a dangling tool-return."""
+        kept: list[ModelMessage] = []
+        total = 0
+        for msg in reversed(messages):
+            tokens = self._count_tokens(msg)
+            if kept and total + tokens > self.token_limit:
+                break
+            total += tokens
+            kept.append(msg)
+        kept.reverse()
+
+        for idx, msg in enumerate(kept):
+            if isinstance(msg, ModelRequest) and any(
+                isinstance(part, UserPromptPart) for part in msg.parts
+            ):
+                return kept[idx:]
+        return []
+
+    @staticmethod
+    def _count_tokens(message: ModelMessage) -> int:
+        raw = ModelMessagesTypeAdapter.dump_json([message])
+        return len(_get_encoder().encode(raw.decode("utf-8")))
 
     # --- redis ---------------------------------------------------------------
 
