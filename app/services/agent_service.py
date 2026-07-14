@@ -32,22 +32,21 @@ from app.services.search_client import SearchClient
 
 # Shared persona + search-tool guidance, reused by both response modes.
 _PERSONA = """\
-You are Marina, a voice DJ assistant for a Discord music bot. The user talks to \
-you (often in Russian). The message may start by addressing you (Марина, Марин, \
-Маринка, Мариша, marina) — that is just how they call you, not part of the \
-command; ignore it as content.
+You are {NAME}, a voice DJ assistant for a Discord music bot. The user talks to \
+you (often in Russian). The message may start by addressing you ({NAME_FORMS}) — \
+that is just how they call you, not part of the command; ignore it as content.
 
 *** LANGUAGE RULE — HIGHEST PRIORITY, NO EXCEPTIONS ***
-`display_text` MUST be written ENTIRELY in English, using only the Latin alphabet. \
-NEVER write Russian or any Cyrillic characters in `display_text`, even when the user \
-writes to you in Russian. The user understands English fine. This is a hard technical \
-constraint: `display_text` is fed to an ENGLISH text-to-speech voice, and any Russian \
-text comes out as garbled, unintelligible noise. Track and artist names may keep their \
-original spelling, but every word YOU write must be English. If you are about to write \
-a Russian word, translate it to English instead.
+`display_text` MUST be written ENTIRELY in {LANG}. NEVER write in any other language, \
+even when the user writes to you in a different language (e.g. Russian). This is a \
+hard technical constraint: `display_text` is read aloud by a {LANG} text-to-speech \
+voice, and text in any other language comes out as garbled, unintelligible noise. \
+Track and artist names may keep their original spelling, but every word YOU write \
+must be {LANG}. If you are about to write a word in another language, translate it \
+to {LANG} instead.
 
 Write ONE reply in `display_text`. It is shown in the chat as-is AND, after the \
-service strips emoji/markdown, is read aloud by that ENGLISH TTS voice. Keep it short, \
+service strips emoji/markdown, is read aloud by that {LANG} TTS voice. Keep it short, \
 natural and conversational; a few emoji are fine (they are removed before speech). Do \
 NOT produce a separate spoken field — the service derives it from `display_text`.
 
@@ -237,8 +236,32 @@ class AgentService:
 
     def _system_text(self, request: AgentRequest) -> str:
         if request.tools:
-            return _PERSONA + _TOOLCALL_RULES + self._render_tools(request.tools)
-        return LEGACY_PROMPT
+            text = _PERSONA + _TOOLCALL_RULES + self._render_tools(request.tools)
+        else:
+            text = LEGACY_PROMPT
+        # Bot identity + language, configured via env so they aren't hardcoded in
+        # the prompt. NAME_FORMS lists the ways the user addresses the bot (name +
+        # its inflected/nickname forms); the TTS voice must match BOT_LANGUAGE.
+        name = self._bot_name()
+        return (
+            text.replace("{NAME_FORMS}", self._bot_name_forms(name))
+            .replace("{NAME}", name)
+            .replace("{LANG}", self._bot_language())
+        )
+
+    @staticmethod
+    def _bot_name() -> str:
+        return (os.getenv("BOT_NAME") or "Marina").strip() or "Marina"
+
+    @staticmethod
+    def _bot_name_forms(name: str) -> str:
+        raw = os.getenv("BOT_NAME_FORMS") or ""
+        forms = [f.strip() for f in raw.split(",") if f.strip()]
+        return ", ".join(forms) if forms else name
+
+    @staticmethod
+    def _bot_language() -> str:
+        return (os.getenv("BOT_LANGUAGE") or "English").strip() or "English"
 
     @staticmethod
     def _render_tools(tools: list[ToolSpec]) -> str:
