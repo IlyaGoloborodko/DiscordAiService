@@ -1,20 +1,26 @@
-import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import emoji
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelRequest, SystemPromptPart
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+
+# Safety net: retry a run when the LM Studio engine returns a 400 rejecting its own
+# output (a stochastic tool-call/parser failure). qwen3.5-9b almost never trips this,
+# but pydantic-ai's own `retries` only covers output validation, not HTTP errors.
+_MODEL_HTTP_RETRIES = 3
 
 from app.data.models import (
     AgentDraft,
     AgentRequest,
     AgentResponse,
     AgentSession,
+    ToolArguments,
     ToolCall,
     ToolCallDraft,
     ToolCallResponse,
@@ -31,12 +37,19 @@ you (often in Russian). The message may start by addressing you (Марина, �
 Маринка, Мариша, marina) — that is just how they call you, not part of the \
 command; ignore it as content.
 
+*** LANGUAGE RULE — HIGHEST PRIORITY, NO EXCEPTIONS ***
+`display_text` MUST be written ENTIRELY in English, using only the Latin alphabet. \
+NEVER write Russian or any Cyrillic characters in `display_text`, even when the user \
+writes to you in Russian. The user understands English fine. This is a hard technical \
+constraint: `display_text` is fed to an ENGLISH text-to-speech voice, and any Russian \
+text comes out as garbled, unintelligible noise. Track and artist names may keep their \
+original spelling, but every word YOU write must be English. If you are about to write \
+a Russian word, translate it to English instead.
+
 Write ONE reply in `display_text`. It is shown in the chat as-is AND, after the \
-service strips emoji/markdown, is read aloud by the text-to-speech voice. The TTS \
-voice is ENGLISH, so `display_text` MUST be written in English — even when the user \
-speaks Russian (Russian would come out as garbled noise). Keep it short, natural \
-and conversational; a few emoji are fine (they are removed before speech). Do NOT \
-produce a separate spoken field — the service derives it from `display_text`.
+service strips emoji/markdown, is read aloud by that ENGLISH TTS voice. Keep it short, \
+natural and conversational; a few emoji are fine (they are removed before speech). Do \
+NOT produce a separate spoken field — the service derives it from `display_text`.
 
 Always use the tools to find real tracks before recommending anything — never \
 invent track ids. Pick the most fitting tool:
@@ -48,54 +61,42 @@ pass the artist AND a representative seed track; both are needed.
 <genre>/<mood>" — `tag` for a genre or mood, `country` when named; omit both for the global top.
 """
 
-# Legacy mode: the bot did NOT send tools, so we answer with action + tracks.
+# Both modes: the model returns display_text + a single `action` + a FLAT list of
+# `track_ids` (strings). Never a nested tracks array — local models can't emit that.
 LEGACY_PROMPT = _PERSONA + """
-Choose the action:
-- "play": user wants one track / to start playing now -> put the single best track in `tracks`.
-- "enqueue": user wants several tracks / a playlist / "an hour of music" -> put multiple tracks in `tracks`.
-- "replace_queue": user explicitly wants to replace what's playing with a new set.
-- "clarify": the request is too vague to act on -> set `clarification`, leave `tracks` empty.
-- "none": user isn't asking for music (small talk) -> just answer, leave `tracks` empty.
+Set `action`:
+- "play": user wants one track / to start now -> put the best track's id in `track_ids`.
+- "enqueue": user wants several tracks / a playlist / "an hour of music" -> put several ids in `track_ids`.
+- "replace_queue": user wants to replace what's playing with a new set.
+- "clarify": too vague to act on -> ask in `clarification`, `track_ids` empty.
+- "none": small talk -> just answer, `track_ids` empty.
 
-Charts and recommendations usually return several tracks -> prefer action "enqueue".
-`tracks` must contain only items returned by the tools, with id/title/url unchanged.
-`display_text`: your single reply (English; emoji/markdown allowed — stripped for speech).
+Charts and recommendations usually mean several tracks -> prefer "enqueue".
+`track_ids` must contain ONLY ids returned by the search tools — copy them exactly, never invent.
 """
 
 # Tool-calling mode header; the concrete bot actions are appended per request.
 _TOOLCALL_RULES = """
-The bot exposes the ACTIONS listed below. To act, emit `tool_calls` — each item is
-{"name": <one of the action names>, "arguments": {...}}. Use ONLY these names.
+The ONLY functions you may call are the search tools (search_tracks,
+get_playlist_tracks, get_similar_tracks, get_top_charts) and `final_result`. You
+ALWAYS answer by calling `final_result`, and never call anything else.
 
-MANDATORY: if the user wants music (include/put on/start/play/add/enqueue/"something
-...", a genre, a mood, an artist), you MUST emit a play or enqueue (or the matching
-action) tool_call with real tracks you found. NEVER describe music in words instead
-of calling the action. You may add a clarifying question, but only TOGETHER with a
-tool_call, never instead of one. If unsure about the genre, still call play/enqueue
-with a popular selection and offer to refine in the next message.
+You do NOT call the bot actions. Instead set the `action` field of `final_result`
+to ONE action name from the list below (a plain string), or "" for no action.
 
-Use ONLY the exact action names from the "Available actions" list below. Do NOT
-invent names — there is no "play_track", "search", or "play_music"; the search
-tools are separate and must never appear in tool_calls. For play/enqueue/
-replace_queue the `arguments.tracks` array MUST be non-empty (the tracks you found);
-an empty call plays nothing and is wrong.
+MANDATORY: if the user wants music (put on / start / play / add / a genre / a mood /
+an artist / "your choice"), FIRST call a search tool to get real tracks, THEN call
+`final_result` with action "play" or "enqueue" and `track_ids` set to the ids you
+just got. Never describe music in display_text without setting an action + track_ids.
+If unsure of the genre, still pick a popular selection and offer to refine next time.
 
 Rules:
-- To start or change music: first search for real tracks with the search tools, then
-  emit ONE tool_call for the matching action, passing the found tracks in
-  `arguments.tracks` as full objects (id, title, uploader, url, duration, provider).
-- For actions whose input schema is empty (e.g. pause/resume/skip/stop): emit the
-  tool_call with `arguments`: {}.
-- Questions about what's playing / what's in the queue / what's next: answer from the
-  current player state in `display_text` and return an EMPTY tool_calls list. Do NOT
-  change the queue.
-- If no action is needed, return an empty tool_calls list.
-- One main action per turn is enough.
+- Controls (pause/resume/skip/stop/...): set `action` to that name, `track_ids` empty.
+- Questions about what's playing / the queue: answer in `display_text`, action "", track_ids empty.
+- Small talk / nothing to do: action "", track_ids empty.
+- `track_ids` must be ids returned by the search tools — copy them exactly, never invent.
 
-display_text: your single reply (English; emoji/markdown allowed — stripped for speech).
-clarification: set only when you must ask a follow-up.
-
-Available actions:
+Allowed action names (plain strings for the `action` field):
 """
 
 
@@ -122,13 +123,26 @@ def clean_for_tts(text: str) -> str:
 # Bump when the response contract changes so stale history from the old contract
 # is abandoned instead of poisoning the model as few-shot examples. v2 abandoned the
 # pre-tool English legacy answers; v3 abandons histories poisoned by hallucinated
-# action names (e.g. "play_track") emitted before server-side validation landed.
-_MEMORY_VERSION = "v3"
+# action names ("play_track"); v4 abandons histories where the assistant emitted a
+# `spoken_answer` field (removed from the schema — the service derives it now), which
+# the model copied from history and which broke the gemma tool-call parser; v5
+# abandons the nested tool_calls-shaped history after the output schema was flattened
+# to a single action + flat track_ids; v6 abandons gemma-4-e4b history after switching
+# the model to qwen3.5-9b (different tool-call template — don't cross-poison).
+_MEMORY_VERSION = "v6"
 
 
 @dataclass
 class AgentDeps:
     search: SearchClient
+    # Tracks returned by the search tools this run, keyed by id. The model outputs
+    # only ids; we resolve them back to full tracks here (and drop invented ids).
+    found: dict[str, Track] = field(default_factory=dict)
+
+    def remember(self, tracks: list[Track]) -> list[Track]:
+        for track in tracks:
+            self.found[track.id] = track
+        return tracks
 
 
 class AgentService:
@@ -158,47 +172,54 @@ class AgentService:
             ctx: RunContext[AgentDeps], query: str, limit: int = 10
         ) -> list[Track]:
             """Search for tracks by a free-text query (artist, track, genre, mood)."""
-            return await ctx.deps.search.search(query, limit)
+            return ctx.deps.remember(await ctx.deps.search.search(query, limit))
 
         @agent.tool
         async def get_playlist_tracks(
             ctx: RunContext[AgentDeps], url: str, limit: int = 50
         ) -> list[Track]:
             """Expand a YouTube playlist (URL or bare playlist id) into its tracks."""
-            return await ctx.deps.search.playlist(url, limit)
+            return ctx.deps.remember(await ctx.deps.search.playlist(url, limit))
 
         @agent.tool
         async def get_similar_tracks(
             ctx: RunContext[AgentDeps],
             artist: str,
-            track: str | None = None,
+            track: str = "",
             limit: int = 10,
         ) -> list[Track]:
             """Recommend tracks in the style of an artist. Always pass a seed
             `track` too (a well-known song by that artist) — the recommendation
             source needs both."""
-            return await ctx.deps.search.similar(artist, track, limit)
+            return ctx.deps.remember(await ctx.deps.search.similar(artist, track or None, limit))
 
         @agent.tool
         async def get_top_charts(
             ctx: RunContext[AgentDeps],
-            tag: str | None = None,
-            country: str | None = None,
+            tag: str = "",
+            country: str = "",
             limit: int = 10,
         ) -> list[Track]:
             """Popular/trending tracks. `tag` for a genre or mood, `country` when
             the user names one; omit both for the global top."""
-            return await ctx.deps.search.charts(tag, country, limit)
+            return ctx.deps.remember(await ctx.deps.search.charts(tag or None, country or None, limit))
 
     # The system prompt is injected fresh into message_history each run (see run),
     # not set on the Agent — so it can never be lost when memory trims history and
     # is always the current version.
+    # Low temperature for reliable tool use; max_tokens is a safety cap against a
+    # runaway loop. Kept generous (2048) so a model with a "thinking" preamble
+    # (qwen3.5) has room to reason AND emit the final tool call without truncation —
+    # a cut-off mid-token is what breaks the parser. Normal replies are far shorter.
+    _MODEL_SETTINGS = {"temperature": 0.2, "max_tokens": 2048}
+
     def _build_legacy_agent(self) -> Agent[AgentDeps, AgentDraft]:
         agent = Agent(
             self._model(),
             output_type=AgentDraft,
             deps_type=AgentDeps,
             retries=5,
+            model_settings=self._MODEL_SETTINGS,
         )
         self._register_search_tools(agent)
         return agent
@@ -209,8 +230,7 @@ class AgentService:
             output_type=ToolCallDraft,
             deps_type=AgentDeps,
             retries=5,
-            # Low temperature: we want reliable tool invocation, not creative prose.
-            model_settings={"temperature": 0.2},
+            model_settings=self._MODEL_SETTINGS,
         )
         self._register_search_tools(agent)
         return agent
@@ -222,10 +242,15 @@ class AgentService:
 
     @staticmethod
     def _render_tools(tools: list[ToolSpec]) -> str:
+        # List names as plain strings + what they mean. Deliberately NOT shaped like
+        # function signatures, so the model doesn't try to call them natively.
+        needs_tracks = {"play", "enqueue", "replace_queue"}
         lines = []
         for tool in tools:
-            schema = json.dumps(tool.input_schema, ensure_ascii=False) if tool.input_schema else "{}"
-            lines.append(f"- {tool.name}: {tool.description} | arguments schema: {schema}")
+            hint = " (needs tracks)" if tool.name in needs_tracks or "tracks" in (
+                tool.input_schema.get("required") or []
+            ) else ""
+            lines.append(f'- "{tool.name}"{hint}: {tool.description}')
         return "\n".join(lines)
 
     # --- run -----------------------------------------------------------------
@@ -246,25 +271,32 @@ class AgentService:
         system = ModelRequest(parts=[SystemPromptPart(content=self._system_text(request))])
         history = [system, *intermediate]
 
-        result = await agent.run(
-            self._format_prompt(request),
-            deps=deps,
-            message_history=history,
-        )
+        # LM Studio can stochastically return a 400 ModelHTTPError (tool-call parser
+        # rejecting the engine's own output), which pydantic-ai does NOT retry — its
+        # `retries` only covers output validation. A fresh attempt usually succeeds,
+        # so retry the whole run a few times.
+        prompt = self._format_prompt(request)
+        result = None
+        for attempt in range(_MODEL_HTTP_RETRIES):
+            try:
+                result = await agent.run(prompt, deps=deps, message_history=history)
+                break
+            except ModelHTTPError:
+                if attempt == _MODEL_HTTP_RETRIES - 1:
+                    raise
+                deps.found.clear()
 
         draft = result.output
         # The model writes one reply (display_text); we derive the spoken form by
         # stripping emoji/markdown, so the two never diverge in meaning.
         spoken = clean_for_tts(draft.display_text)
+        # Map the model's ids back to full tracks it actually found; invented ids
+        # (not in deps.found) are silently dropped.
+        tracks = [deps.found[i] for i in draft.track_ids if i in deps.found]
 
         clean = True
         if isinstance(draft, ToolCallDraft) and request.tools is not None:
-            # The model can hallucinate action names ("play_track") or emit music
-            # actions with no tracks. Drop those before they reach the bot, and only
-            # persist the turn when it was clean, so a bad answer can never poison
-            # the next turn's history.
-            tool_calls, dropped = self._validate_tool_calls(draft.tool_calls, request.tools)
-            clean = dropped == 0
+            tool_calls, clean = self._build_tool_calls(draft.action, tracks, request.tools)
             response: AgentResponse | ToolCallResponse = ToolCallResponse(
                 spoken_answer=spoken,
                 display_text=draft.display_text,
@@ -276,36 +308,31 @@ class AgentService:
                 spoken_answer=spoken,
                 display_text=draft.display_text,
                 action=draft.action,
-                tracks=draft.tracks,
+                tracks=tracks,
                 clarification=draft.clarification,
             )
 
+        # Only persist clean turns, so a bad answer can never poison the next turn.
         if clean:
             await self.memory.save(session_key, result.all_messages())
 
         return response
 
     @staticmethod
-    def _validate_tool_calls(
-        calls: list["ToolCall"], tools: list[ToolSpec]
-    ) -> tuple[list["ToolCall"], int]:
-        """Keep only calls that name a declared action; require non-empty `tracks`
-        for actions whose schema demands them. Returns (kept, dropped_count)."""
-        by_name = {tool.name: tool for tool in tools}
-        kept: list[ToolCall] = []
-        dropped = 0
-        for call in calls:
-            spec = by_name.get(call.name)
-            if spec is None:
-                dropped += 1
-                continue
-            if "tracks" in (spec.input_schema.get("required") or []):
-                tracks = call.arguments.get("tracks") if isinstance(call.arguments, dict) else None
-                if not tracks:
-                    dropped += 1
-                    continue
-            kept.append(call)
-        return kept, dropped
+    def _build_tool_calls(
+        action: str, tracks: list[Track], tools: list[ToolSpec]
+    ) -> tuple[list[ToolCall], bool]:
+        """Turn the model's single (action, tracks) into the bot's tool_calls.
+        Returns (tool_calls, clean). A hallucinated action name, or a music action
+        with no resolved tracks, yields no call and clean=False (won't be saved)."""
+        if not action:
+            return [], True
+        spec = next((t for t in tools if t.name == action), None)
+        if spec is None:
+            return [], False  # hallucinated action name
+        if "tracks" in (spec.input_schema.get("required") or []) and not tracks:
+            return [], False  # music action without real tracks
+        return [ToolCall(name=action, arguments=ToolArguments(tracks=tracks))], True
 
     async def forget(self, session: AgentSession) -> None:
         """Clear stored conversation memory for a session."""

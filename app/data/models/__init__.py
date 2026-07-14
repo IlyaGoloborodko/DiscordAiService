@@ -12,6 +12,7 @@ from .agent import (
     AgentResponse,
     ToolSpec,
     ToolCall,
+    ToolArguments,
     ToolCallDraft,
     ToolCallResponse,
 )

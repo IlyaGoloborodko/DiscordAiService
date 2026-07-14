@@ -41,25 +41,48 @@ class AgentRequest(BaseModel):
     )
 
 
-class ToolCall(BaseModel):
-    name: str = Field(description="Name of a bot action to invoke; must be one of the request's tools.")
-    arguments: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Arguments for the action. For music actions include `tracks`; "
-        "for no-input controls leave empty.",
-    )
+class ToolArguments(BaseModel):
+    """Arguments for a bot action in the response. Built by the service from the
+    model's chosen track ids, so it can carry full tracks (the LLM never generates
+    this nested shape — it only emits flat id strings)."""
 
+    tracks: list[Track] = Field(default_factory=list)
+
+
+class ToolCall(BaseModel):
+    name: str = Field(description="Name of a bot action to invoke; one of the request's tools.")
+    arguments: ToolArguments = Field(default_factory=ToolArguments)
+
+
+# --- LLM output (drafts) -------------------------------------------------------
+# Deliberately FLAT: a single action string + a flat list of track-id strings.
+# Local models (gemma-4-e4b via LM Studio) cannot reliably emit arrays of objects
+# in a constrained tool call — nested `tracks:[{id,title}]` fails the gemma parser,
+# only a flat `track_ids:[str]` array works. The service maps ids back to full
+# tracks (from what the search tools returned), which also drops any invented id.
 
 class ToolCallDraft(BaseModel):
-    """What the LLM generates in tool-calling mode. It writes a single reply in
-    `display_text`; the service derives `spoken_answer` from it (cleaned)."""
+    """What the LLM generates in tool-calling mode."""
 
-    display_text: str = Field(description="The single reply. Goes to the chat as-is and, cleaned, to TTS.")
-    clarification: str | None = Field(default=None, description="A follow-up question if one is needed.")
-    tool_calls: list[ToolCall] = Field(
+    display_text: str = Field(description="The single reply. Shown in chat and, cleaned, spoken by TTS.")
+    action: str = Field(default="", description='One action name to run, or "" for no action.')
+    track_ids: list[str] = Field(
         default_factory=list,
-        description="Actions to run; empty when no action is required (bot keeps playing as-is).",
+        description="Ids (from search results) to act on. Only for actions that take tracks.",
     )
+    clarification: str | None = Field(default=None, description="A follow-up question if one is needed.")
+
+
+class AgentDraft(BaseModel):
+    """What the LLM generates in legacy mode (no bot tools declared)."""
+
+    display_text: str = Field(description="The single reply. Shown in chat and, cleaned, spoken by TTS.")
+    action: AgentAction = Field(description="What the bot should do with the tracks.")
+    track_ids: list[str] = Field(
+        default_factory=list,
+        description="Ids (from search results) to act on.",
+    )
+    clarification: str | None = Field(default=None, description="A follow-up question when action == 'clarify'.")
 
 
 class ToolCallResponse(BaseModel):
@@ -69,18 +92,6 @@ class ToolCallResponse(BaseModel):
     display_text: str = Field(description="The assistant reply for the Discord chat; emoji/markdown allowed.")
     clarification: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
-
-
-class AgentDraft(BaseModel):
-    """What the LLM generates in legacy mode; `spoken_answer` is derived, not generated."""
-
-    display_text: str = Field(description="The single reply. Goes to the chat as-is and, cleaned, to TTS.")
-    action: AgentAction = Field(description="What the bot should do with `tracks`.")
-    tracks: list[Track] = Field(
-        default_factory=list,
-        description="Tracks to act on, taken verbatim from search results.",
-    )
-    clarification: str | None = Field(default=None, description="A follow-up question when action == 'clarify'.")
 
 
 class AgentResponse(BaseModel):

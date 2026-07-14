@@ -14,10 +14,10 @@ from app.data.models import (
     AgentDraft,
     AgentRequest,
     AgentResponse,
-    ToolCall,
     ToolCallDraft,
     ToolCallResponse,
     ToolSpec,
+    Track,
 )
 from app.services.agent_service import AgentService, clean_for_tts
 
@@ -31,38 +31,41 @@ TOOLS = [
 ]
 
 
-class ValidateToolCallsTests(unittest.TestCase):
-    PLAY = ToolSpec(name="play", description="", input_schema={"required": ["tracks"], "properties": {"tracks": {}}})
-    PAUSE = ToolSpec(name="pause", description="", input_schema={"properties": {}})
-    DECLARED = [PLAY, PAUSE]
+class BuildToolCallsTests(unittest.TestCase):
+    PLAY = ToolSpec(name="play", input_schema={"required": ["tracks"]})
+    PAUSE = ToolSpec(name="pause", input_schema={})
+    TOOLS = [PLAY, PAUSE]
+    TRACK = Track(id="x", title="t")
 
-    def test_drops_hallucinated_name(self):
-        calls = [ToolCall(name="play_track", arguments={})]
-        kept, dropped = AgentService._validate_tool_calls(calls, self.DECLARED)
-        self.assertEqual(kept, [])
-        self.assertEqual(dropped, 1)
+    def test_no_action(self):
+        calls, clean = AgentService._build_tool_calls("", [], self.TOOLS)
+        self.assertEqual(calls, [])
+        self.assertTrue(clean)
 
-    def test_drops_music_action_without_tracks(self):
-        calls = [ToolCall(name="play", arguments={})]
-        kept, dropped = AgentService._validate_tool_calls(calls, self.DECLARED)
-        self.assertEqual(kept, [])
-        self.assertEqual(dropped, 1)
+    def test_hallucinated_action_is_dirty(self):
+        calls, clean = AgentService._build_tool_calls("play_track", [self.TRACK], self.TOOLS)
+        self.assertEqual(calls, [])
+        self.assertFalse(clean)
 
-    def test_keeps_play_with_tracks(self):
-        calls = [ToolCall(name="play", arguments={"tracks": [{"id": "x", "title": "t"}]})]
-        kept, dropped = AgentService._validate_tool_calls(calls, self.DECLARED)
-        self.assertEqual(len(kept), 1)
-        self.assertEqual(dropped, 0)
+    def test_music_action_without_tracks_is_dirty(self):
+        calls, clean = AgentService._build_tool_calls("play", [], self.TOOLS)
+        self.assertEqual(calls, [])
+        self.assertFalse(clean)
 
-    def test_keeps_control_with_empty_args(self):
-        calls = [ToolCall(name="pause", arguments={})]
-        kept, dropped = AgentService._validate_tool_calls(calls, self.DECLARED)
-        self.assertEqual(len(kept), 1)
-        self.assertEqual(dropped, 0)
+    def test_play_with_tracks(self):
+        calls, clean = AgentService._build_tool_calls("play", [self.TRACK], self.TOOLS)
+        self.assertTrue(clean)
+        self.assertEqual(calls[0].name, "play")
+        self.assertEqual(calls[0].arguments.tracks[0].id, "x")
+
+    def test_control_needs_no_tracks(self):
+        calls, clean = AgentService._build_tool_calls("pause", [], self.TOOLS)
+        self.assertTrue(clean)
+        self.assertEqual(calls[0].name, "pause")
 
 
 class DirtyTurnNotSavedTests(unittest.IsolatedAsyncioTestCase):
-    """A turn with a dropped (hallucinated) tool_call must not be persisted."""
+    """A turn that produced no valid action (hallucinated / no tracks) is not saved."""
 
     async def asyncSetUp(self):
         self.load = mock.patch("app.services.memory.MemoryStore.load",
@@ -71,28 +74,41 @@ class DirtyTurnNotSavedTests(unittest.IsolatedAsyncioTestCase):
         self.load.start(); self.save.start()
         self.addCleanup(self.load.stop); self.addCleanup(self.save.stop)
 
-    async def _run_with_output(self, output, tools):
+    async def _run(self, draft, tools, found=None):
         svc = AgentService()
+
+        async def fake_run(prompt, deps=None, message_history=None):
+            if found:
+                deps.found.update(found)
+            return _FakeResult(draft)
+
         fake_agent = mock.Mock()
-        fake_agent.run = mock.AsyncMock(return_value=_FakeResult(output))
+        fake_agent.run = fake_run
         with mock.patch.dict(os.environ, _ENV), \
              mock.patch.object(svc, "_build_toolcall_agent", return_value=fake_agent):
-            await svc.run(AgentRequest(message="play hardcore", tools=tools))
-        return svc.memory.save
+            resp = await svc.run(AgentRequest(message="play hardcore", tools=tools))
+        return svc.memory.save, resp
 
     async def test_dirty_turn_not_saved(self):
         tools = [ToolSpec(name="play", input_schema={"required": ["tracks"]})]
-        out = ToolCallDraft(display_text="ok",
-                            tool_calls=[ToolCall(name="play_track", arguments={})])
-        save = await self._run_with_output(out, tools)
+        draft = ToolCallDraft(display_text="ok", action="play_track")
+        save, _ = await self._run(draft, tools)
         save.assert_not_called()
 
-    async def test_clean_turn_saved(self):
+    async def test_clean_turn_saved_and_resolves_ids(self):
         tools = [ToolSpec(name="play", input_schema={"required": ["tracks"]})]
-        out = ToolCallDraft(display_text="ok",
-                            tool_calls=[ToolCall(name="play", arguments={"tracks": [{"id": "a", "title": "b"}]})])
-        save = await self._run_with_output(out, tools)
+        draft = ToolCallDraft(display_text="ok", action="play", track_ids=["a"])
+        save, resp = await self._run(draft, tools, found={"a": Track(id="a", title="Song")})
         save.assert_called_once()
+        self.assertEqual(resp.tool_calls[0].name, "play")
+        self.assertEqual(resp.tool_calls[0].arguments.tracks[0].title, "Song")
+
+    async def test_invented_id_dropped(self):
+        tools = [ToolSpec(name="play", input_schema={"required": ["tracks"]})]
+        draft = ToolCallDraft(display_text="ok", action="play", track_ids=["ghost"])
+        save, resp = await self._run(draft, tools)  # nothing found -> no real tracks
+        self.assertEqual(resp.tool_calls, [])
+        save.assert_not_called()
 
 
 class MemoryTrimTests(unittest.TestCase):
@@ -202,12 +218,12 @@ class CleanForTtsTests(unittest.TestCase):
 
 
 class RenderAndPromptTests(unittest.TestCase):
-    def test_render_tools_lists_names_and_schema(self):
+    def test_render_tools_lists_names_as_strings(self):
         rendered = AgentService._render_tools(TOOLS)
-        self.assertIn("- play:", rendered)
-        self.assertIn("- pause:", rendered)
-        self.assertIn('arguments schema: {"tracks": []}', rendered)
-        self.assertIn("arguments schema: {}", rendered)  # empty-input control
+        # Names are quoted string values, not function-signature-looking entries.
+        self.assertIn('"play" (needs tracks)', rendered)
+        self.assertIn('"pause"', rendered)
+        self.assertNotIn("arguments schema", rendered)
 
     def test_format_prompt_includes_now_playing_and_queue(self):
         req = AgentRequest(
@@ -249,12 +265,14 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tools_present_uses_toolcall_agent(self):
         svc = AgentService()
-        draft = ToolCallDraft(
-            display_text="ok",
-            tool_calls=[ToolCall(name="enqueue", arguments={"tracks": [{"id": "a", "title": "b"}]})],
-        )
+        draft = ToolCallDraft(display_text="ok", action="enqueue", track_ids=["a"])
+
+        async def fake_run(prompt, deps=None, message_history=None):
+            deps.found["a"] = Track(id="a", title="b")
+            return _FakeResult(draft)
+
         fake_agent = mock.Mock()
-        fake_agent.run = mock.AsyncMock(return_value=_FakeResult(draft))
+        fake_agent.run = fake_run
 
         with mock.patch.dict(os.environ, _ENV), \
              mock.patch.object(svc, "_build_toolcall_agent", return_value=fake_agent) as build_tc, \
@@ -266,11 +284,12 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         build_legacy.assert_not_called()
         self.assertIsInstance(out, ToolCallResponse)
         self.assertEqual(out.tool_calls[0].name, "enqueue")
+        self.assertEqual(out.tool_calls[0].arguments.tracks[0].id, "a")
         self.assertEqual(out.spoken_answer, "ok")  # derived from display_text
 
     async def test_no_tools_uses_legacy_agent(self):
         svc = AgentService()
-        draft = AgentDraft(display_text="ok 🎵", action="play", tracks=[])
+        draft = AgentDraft(display_text="ok 🎵", action="play", track_ids=[])
         fake_agent = mock.Mock()
         fake_agent.run = mock.AsyncMock(return_value=_FakeResult(draft))
 
@@ -294,8 +313,8 @@ class SystemTextTest(unittest.TestCase):
     def test_toolcall_system_text_lists_actions(self):
         req = AgentRequest(message="hi", tools=TOOLS)
         text = AgentService()._system_text(req)
-        self.assertIn("- play:", text)
-        self.assertIn("- pause:", text)
+        self.assertIn('"play"', text)
+        self.assertIn('"pause"', text)
 
     def test_legacy_system_text_without_tools(self):
         req = AgentRequest(message="hi")
