@@ -36,6 +36,12 @@ returns a reply + `tool_calls`. Local LLM over an OpenAI-compatible endpoint
 - **Memory versioning:** `_MEMORY_VERSION` prefixes the session key. Bump it
   whenever the response contract or model changes, so stale history can't poison
   the model as few-shot examples. (Currently `v6`, after the qwen3.5 switch.)
+- **Memory stores only clean conversational turns** — a `UserPromptPart` request +
+  a `TextPart` response (Marina's `display_text`) — **never the raw agentic
+  transcript** (tool calls, tool returns, reasoning). Replaying that scaffolding is
+  fragile: strict chat templates (qwen) reject a history that doesn't start with the
+  system message or has an orphaned tool-return, and it bloats context with search
+  JSON. Don't go back to persisting `result.all_messages()`.
 - **Only "clean" turns are persisted** (`_build_tool_calls` returns `clean`), so a
   bad/hallucinated answer never poisons the next turn.
 - **`ModelHTTPError` retry loop** wraps `agent.run` — LM Studio can return a 400

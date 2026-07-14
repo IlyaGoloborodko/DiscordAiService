@@ -6,7 +6,13 @@ import emoji
 
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelRequest, SystemPromptPart
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    TextPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -127,8 +133,10 @@ def clean_for_tts(text: str) -> str:
 # the model copied from history and which broke the gemma tool-call parser; v5
 # abandons the nested tool_calls-shaped history after the output schema was flattened
 # to a single action + flat track_ids; v6 abandons gemma-4-e4b history after switching
-# the model to qwen3.5-9b (different tool-call template — don't cross-poison).
-_MEMORY_VERSION = "v6"
+# the model to qwen3.5-9b (different tool-call template — don't cross-poison); v7
+# abandons the raw agentic transcript (tool calls + tool returns) that we used to
+# persist — we now store only clean user/assistant-text turns (see run()).
+_MEMORY_VERSION = "v7"
 
 
 @dataclass
@@ -335,11 +343,28 @@ class AgentService:
                 clarification=draft.clarification,
             )
 
-        # Only persist clean turns, so a bad answer can never poison the next turn.
+        # Persist only a CLEAN conversational turn: the user's message and Marina's
+        # reply text — never the raw agentic transcript (tool calls, tool returns,
+        # reasoning). Replaying that scaffolding is fragile (strict chat templates
+        # like qwen's reject a history that doesn't start with the system message or
+        # has an orphaned tool-return) and bloats context with search-result JSON.
+        # The model gets fresh tools every run; it needs the conversation, not the
+        # mechanics. Only clean turns are saved, so a bad answer can't poison the next.
         if clean:
-            await self.memory.save(session_key, result.all_messages())
+            turn = [
+                ModelRequest(parts=[UserPromptPart(content=self._history_user_text(request))]),
+                ModelResponse(parts=[TextPart(content=draft.display_text)]),
+            ]
+            await self.memory.save(session_key, [*intermediate, *turn])
 
         return response
+
+    @staticmethod
+    def _history_user_text(request: AgentRequest) -> str:
+        """The user turn as stored in memory — who + message, without the volatile
+        player-state block (that is fed fresh via `context` each run)."""
+        who = request.session.user_name or "Unknown user"
+        return f"{who}: {request.message}"
 
     @staticmethod
     def _build_tool_calls(
