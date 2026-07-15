@@ -20,4 +20,5 @@ dependencies = [
     "sounddevice>=0.5.5",
     "uvicorn>=0.48.0",
     "wyoming>=1.9.0",
+    "openai>=2.38.0",
 ]

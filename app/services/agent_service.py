@@ -214,11 +214,14 @@ class AgentService:
     # The system prompt is injected fresh into message_history each run (see run),
     # not set on the Agent — so it can never be lost when memory trims history and
     # is always the current version.
-    # Low temperature for reliable tool use; max_tokens is a safety cap against a
-    # runaway loop. Kept generous (2048) so a model with a "thinking" preamble
-    # (qwen3.5) has room to reason AND emit the final tool call without truncation —
-    # a cut-off mid-token is what breaks the parser. Normal replies are far shorter.
-    _MODEL_SETTINGS = {"temperature": 0.2, "max_tokens": 2048}
+    # Low temperature for reliable tool use; max_tokens caps the reply (pydantic-ai
+    # maps it to max_completion_tokens). `openai_reasoning_effort='none'` is REQUIRED
+    # for GPT-5.x reasoning models to use function tools over /v1/chat/completions —
+    # otherwise OpenAI 400s ("... not supported ... set reasoning_effort to 'none'").
+    # It also turns the reasoning preamble off, which is what we want: this is fast
+    # action routing, not a task that benefits from chain-of-thought. Harmless on
+    # non-reasoning models. Bump/relax per model if a future one needs to think.
+    _MODEL_SETTINGS = {"temperature": 0.2, "max_tokens": 2048, "openai_reasoning_effort": "none"}
 
     def _build_legacy_agent(self) -> Agent[AgentDeps, AgentDraft]:
         agent = Agent(
