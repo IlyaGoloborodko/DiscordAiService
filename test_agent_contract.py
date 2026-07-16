@@ -19,7 +19,7 @@ from app.data.models import (
     ToolSpec,
     Track,
 )
-from app.services.agent_service import AgentService, clean_for_tts
+from app.services.agent_service import AgentDeps, AgentService, clean_for_tts
 
 _ENV = {"TM_MODEL_NAME": "dummy", "TM_BASE_URL": "http://127.0.0.1:9/v1", "TM_API_KEY": "x"}
 
@@ -64,8 +64,9 @@ class BuildToolCallsTests(unittest.TestCase):
         self.assertEqual(calls[0].name, "pause")
 
 
-class DirtyTurnNotSavedTests(unittest.IsolatedAsyncioTestCase):
-    """A turn that produced no valid action (hallucinated / no tracks) is not saved."""
+class _AgentRunHarness(unittest.IsolatedAsyncioTestCase):
+    """Runs AgentService.run with the LLM and memory stubbed out. No test methods of
+    its own — subclasses bring those."""
 
     async def asyncSetUp(self):
         self.load = mock.patch("app.services.memory.MemoryStore.load",
@@ -89,6 +90,10 @@ class DirtyTurnNotSavedTests(unittest.IsolatedAsyncioTestCase):
             resp = await svc.run(AgentRequest(message="play hardcore", tools=tools))
         return svc.memory.save, resp
 
+
+class DirtyTurnNotSavedTests(_AgentRunHarness):
+    """A turn that produced no valid action (hallucinated / no tracks) is not saved."""
+
     async def test_dirty_turn_not_saved(self):
         tools = [ToolSpec(name="play", input_schema={"required": ["tracks"]})]
         draft = ToolCallDraft(display_text="ok", action="play_track")
@@ -109,6 +114,99 @@ class DirtyTurnNotSavedTests(unittest.IsolatedAsyncioTestCase):
         save, resp = await self._run(draft, tools)  # nothing found -> no real tracks
         self.assertEqual(resp.tool_calls, [])
         save.assert_not_called()
+
+
+class ReplyMatchesToolCallsTests(_AgentRunHarness):
+    """The reply must never claim an action the service dropped: the bot speaks it
+    aloud and the user believes their ears."""
+
+    async def test_dropped_action_does_not_claim_success(self):
+        tools = [ToolSpec(name="play", input_schema={"required": ["tracks"]})]
+        draft = ToolCallDraft(display_text="Putting on some metal!", action="play")
+        _, resp = await self._run(draft, tools)  # no tracks -> action dropped
+        self.assertEqual(resp.tool_calls, [])
+        self.assertNotIn("metal", resp.display_text.lower())
+        self.assertEqual(resp.display_text, AgentService._action_failed_text())
+        self.assertEqual(resp.spoken_answer, clean_for_tts(resp.display_text))
+
+    async def test_hallucinated_action_does_not_claim_success(self):
+        tools = [ToolSpec(name="play", input_schema={"required": ["tracks"]})]
+        draft = ToolCallDraft(display_text="Playing it now!", action="play_track")
+        _, resp = await self._run(draft, tools)
+        self.assertEqual(resp.tool_calls, [])
+        self.assertEqual(resp.display_text, AgentService._action_failed_text())
+
+    async def test_delivered_action_keeps_the_models_reply(self):
+        tools = [ToolSpec(name="play", input_schema={"required": ["tracks"]})]
+        draft = ToolCallDraft(display_text="Putting on some metal!", action="play", track_ids=["a"])
+        _, resp = await self._run(draft, tools, found={"a": Track(id="a", title="Song")})
+        self.assertEqual(resp.display_text, "Putting on some metal!")
+        self.assertEqual(resp.tool_calls[0].name, "play")
+
+
+class DurationFilterTests(unittest.TestCase):
+    """Hour-long compilations are dropped before the model can pick them: the bot
+    treats each item as one track, so a mix is one un-skippable queue entry."""
+
+    def test_long_mix_dropped_short_track_kept(self):
+        deps = AgentDeps(search=None)
+        song = Track(id="s", title="Song", duration=303.0)
+        mix = Track(id="m", title="Thrash Metal Mix", duration=6493.0)
+        with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
+            kept = deps.remember([song, mix])
+        self.assertEqual([t.id for t in kept], ["s"])
+        self.assertNotIn("m", deps.found)  # model cannot resolve it either
+
+    def test_unknown_duration_kept(self):
+        deps = AgentDeps(search=None)
+        with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
+            kept = deps.remember([Track(id="x", title="Chart hit", duration=None)])
+        self.assertEqual([t.id for t in kept], ["x"])
+
+    def test_limit_is_configurable(self):
+        deps = AgentDeps(search=None)
+        mix = Track(id="m", title="Long", duration=1200.0)
+        with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "1800"}):
+            self.assertEqual([t.id for t in deps.remember([mix])], ["m"])
+
+
+class ChartsFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """A non-English tag returns nothing from the chart source; the tool must fall
+    back to a plain search rather than hand the model an empty list."""
+
+    @staticmethod
+    def _charts_tool(agent):
+        # The tools are registered as closures; grab the one under test by name.
+        return agent._function_toolset.tools["get_top_charts"].function
+
+    async def _call(self, charts_result, search_result, tag="металл"):
+        with mock.patch.dict(os.environ, _ENV):
+            agent = AgentService()._build_toolcall_agent()
+        search = mock.Mock()
+        search.charts = mock.AsyncMock(return_value=charts_result)
+        search.search = mock.AsyncMock(return_value=search_result)
+        deps = AgentDeps(search=search)
+        ctx = mock.Mock(deps=deps)
+        tracks = await self._charts_tool(agent)(ctx, tag=tag)
+        return tracks, search
+
+    async def test_empty_charts_falls_back_to_search(self):
+        hit = Track(id="a", title="Slipknot - Psychosocial", duration=303.0)
+        tracks, search = await self._call([], [hit])
+        search.search.assert_awaited_once()
+        self.assertEqual([t.id for t in tracks], ["a"])
+
+    async def test_non_empty_charts_does_not_search(self):
+        hit = Track(id="c", title="Chart hit", duration=200.0)
+        tracks, search = await self._call([hit], [])
+        search.search.assert_not_awaited()
+        self.assertEqual([t.id for t in tracks], ["c"])
+
+    async def test_no_tag_and_empty_charts_does_not_search(self):
+        # Without a tag there is nothing to search for; the global top is legitimately
+        # empty-able and must not turn into a bogus search.
+        _, search = await self._call([], [], tag="")
+        search.search.assert_not_awaited()
 
 
 class MemoryTrimTests(unittest.TestCase):

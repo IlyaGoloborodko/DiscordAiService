@@ -64,6 +64,12 @@ invent track ids. Pick the most fitting tool:
 pass the artist AND a representative seed track; both are needed.
 - `get_top_charts(tag, country)`: "what's popular / trending" or "an hour of \
 <genre>/<mood>" — `tag` for a genre or mood, `country` when named; omit both for the global top.
+
+`tag` MUST be an ENGLISH genre/mood word — the chart source only indexes English \
+tags. Translate the user's word first: "металл" -> "metal", "фонк" -> "phonk", \
+"тяжёлое" -> "metal". Never pass Russian to `tag`. And never fall back to calling \
+`get_top_charts` with NO tag when a genre was asked for — that returns the global \
+pop chart, not what the user wanted; use `search_tracks(<genre>)` instead.
 """
 
 # Both modes: the model returns display_text + a single `action` + a FLAT list of
@@ -139,6 +145,33 @@ def clean_for_tts(text: str) -> str:
 _MEMORY_VERSION = "v7"
 
 
+# The search backend interleaves real tracks with hour-long compilations ("Thrash
+# Metal Mix", 108 min). The bot treats every item as ONE track, so a mix becomes a
+# single un-skippable queue entry, `skip` throws away an hour, and the periodic DJ
+# break never fires. Drop them here — the model never even sees them.
+_DEFAULT_MAX_TRACK_SECONDS = 600
+
+
+def _max_track_seconds() -> int:
+    try:
+        return int(os.getenv("MAX_TRACK_SECONDS") or _DEFAULT_MAX_TRACK_SECONDS)
+    except ValueError:
+        return _DEFAULT_MAX_TRACK_SECONDS
+
+
+# Spoken when the model promised an action the service had to drop. Must be in
+# BOT_LANGUAGE; override via TEXT_ACTION_FAILED when the bot speaks another language.
+_DEFAULT_ACTION_FAILED = (
+    "Sorry, I couldn't find anything that fits — want to try another genre or artist?"
+)
+
+
+def fits_duration(track: Track) -> bool:
+    """Whether a search hit is a real track rather than a long mix. Unknown duration
+    is kept: charts/similar results often omit it and are usually real tracks."""
+    return track.duration is None or track.duration <= _max_track_seconds()
+
+
 @dataclass
 class AgentDeps:
     search: SearchClient
@@ -147,9 +180,12 @@ class AgentDeps:
     found: dict[str, Track] = field(default_factory=dict)
 
     def remember(self, tracks: list[Track]) -> list[Track]:
-        for track in tracks:
+        """Cache what the search tools found, dropping over-long compilations so the
+        model can neither see nor pick them."""
+        keep = [track for track in tracks if fits_duration(track)]
+        for track in keep:
             self.found[track.id] = track
-        return tracks
+        return keep
 
 
 class AgentService:
@@ -207,9 +243,19 @@ class AgentService:
             country: str = "",
             limit: int = 10,
         ) -> list[Track]:
-            """Popular/trending tracks. `tag` for a genre or mood, `country` when
-            the user names one; omit both for the global top."""
-            return ctx.deps.remember(await ctx.deps.search.charts(tag or None, country or None, limit))
+            """Popular/trending tracks. `tag` is a genre or mood and MUST be an
+            English word — the chart source only indexes English tags, so translate
+            the user's genre first ("металл" -> "metal"). `country` when the user
+            names one; omit both for the global top."""
+            tracks = await ctx.deps.search.charts(tag or None, country or None, limit)
+            if not tracks and tag:
+                # The chart source only knows English tags, so a non-English or
+                # obscure one returns nothing. Fall back to a plain search instead of
+                # handing back an empty list: on empty the model either gives up
+                # (action set, no track ids) or silently retries with no tag at all,
+                # which is the global top — pop/hip-hop regardless of what was asked.
+                tracks = await ctx.deps.search.search(tag, limit)
+            return ctx.deps.remember(tracks)
 
     # The system prompt is injected fresh into message_history each run (see run),
     # not set on the Agent — so it can never be lost when memory trims history and
@@ -275,6 +321,13 @@ class AgentService:
         return (os.getenv("BOT_LANGUAGE") or "English").strip() or "English"
 
     @staticmethod
+    def _action_failed_text() -> str:
+        """Reply sent when the model claimed an action the service could not deliver
+        (unknown action name, or a music action with no real tracks). Env-configurable
+        because it is spoken aloud and so must be written in BOT_LANGUAGE."""
+        return (os.getenv("TEXT_ACTION_FAILED") or "").strip() or _DEFAULT_ACTION_FAILED
+
+    @staticmethod
     def _render_tools(tools: list[ToolSpec]) -> str:
         # List names as plain strings + what they mean. Deliberately NOT shaped like
         # function signatures, so the model doesn't try to call them natively.
@@ -321,9 +374,6 @@ class AgentService:
                 deps.found.clear()
 
         draft = result.output
-        # The model writes one reply (display_text); we derive the spoken form by
-        # stripping emoji/markdown, so the two never diverge in meaning.
-        spoken = clean_for_tts(draft.display_text)
         # Map the model's ids back to full tracks it actually found; invented ids
         # (not in deps.found) are silently dropped.
         tracks = [deps.found[i] for i in draft.track_ids if i in deps.found]
@@ -331,15 +381,20 @@ class AgentService:
         clean = True
         if isinstance(draft, ToolCallDraft) and request.tools is not None:
             tool_calls, clean = self._build_tool_calls(draft.action, tracks, request.tools)
+            # The reply and the tool_calls must agree. When the action was dropped the
+            # model's text still claims it happened ("Putting on some metal") — the bot
+            # would speak that and play nothing, and the user believes their ears. So
+            # replace the text rather than let it lie.
+            text = draft.display_text if clean else self._action_failed_text()
             response: AgentResponse | ToolCallResponse = ToolCallResponse(
-                spoken_answer=spoken,
-                display_text=draft.display_text,
+                spoken_answer=clean_for_tts(text),
+                display_text=text,
                 clarification=draft.clarification,
                 tool_calls=tool_calls,
             )
         else:
             response = AgentResponse(
-                spoken_answer=spoken,
+                spoken_answer=clean_for_tts(draft.display_text),
                 display_text=draft.display_text,
                 action=draft.action,
                 tracks=tracks,
