@@ -1,6 +1,9 @@
+import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 import emoji
 
@@ -26,7 +29,6 @@ from app.data.models import (
     AgentRequest,
     AgentResponse,
     AgentSession,
-    ToolArguments,
     ToolCall,
     ToolCallDraft,
     ToolCallResponse,
@@ -35,6 +37,8 @@ from app.data.models import (
 )
 from app.services.memory import MemoryStore
 from app.services.search_client import SearchClient
+
+logger = logging.getLogger(__name__)
 
 # Shared persona + search-tool guidance, reused by both response modes.
 _PERSONA = """\
@@ -101,6 +105,13 @@ an artist / "your choice"), FIRST call a search tool to get real tracks, THEN ca
 just got. Never describe music in display_text without setting an action + track_ids.
 If unsure of the genre, still pick a popular selection and offer to refine next time.
 
+Some actions take arguments of their own — they are listed after the action name
+below. Put those in `action_args_json` as a flat JSON object using exactly the listed
+names, e.g. an action listed as `level=<integer 1-10>` -> `action_args_json` =
+{"level": 6}. Numbers written as words are still numbers ("до единицы" -> 1). Leave
+`action_args_json` as "" for actions that take no arguments or only take tracks.
+`track_ids` is never put in `action_args_json` — it has its own field.
+
 Rules:
 - Controls (pause/resume/skip/stop/...): set `action` to that name, `track_ids` empty.
 - Questions about what's playing / the queue: answer in `display_text`, action "", track_ids empty.
@@ -164,6 +175,26 @@ def _max_track_seconds() -> int:
 _DEFAULT_ACTION_FAILED = (
     "Sorry, I couldn't find anything that fits — want to try another genre or artist?"
 )
+
+
+def _coerce_to_schema(value: Any, prop: dict[str, Any]) -> Any:
+    """Coerce a model-supplied argument to the JSON-schema type the bot declared.
+    The model reliably picks the right value but is loose about its type ("6" vs 6),
+    and the bot validates against its schema. Returns None when the value cannot be
+    represented — the caller then treats the argument as missing."""
+    declared = prop.get("type")
+    try:
+        if declared == "integer":
+            return int(float(value)) if not isinstance(value, bool) else None
+        if declared == "number":
+            return float(value)
+        if declared == "boolean":
+            return value if isinstance(value, bool) else str(value).lower() in ("true", "1", "yes")
+        if declared == "string":
+            return value if isinstance(value, str) else str(value)
+    except (TypeError, ValueError):
+        return None
+    return value  # no declared type (or a compound one): pass through untouched
 
 
 def fits_duration(track: Track) -> bool:
@@ -327,18 +358,36 @@ class AgentService:
         because it is spoken aloud and so must be written in BOT_LANGUAGE."""
         return (os.getenv("TEXT_ACTION_FAILED") or "").strip() or _DEFAULT_ACTION_FAILED
 
-    @staticmethod
-    def _render_tools(tools: list[ToolSpec]) -> str:
+    @classmethod
+    def _render_tools(cls, tools: list[ToolSpec]) -> str:
         # List names as plain strings + what they mean. Deliberately NOT shaped like
-        # function signatures, so the model doesn't try to call them natively.
-        needs_tracks = {"play", "enqueue", "replace_queue"}
+        # function signatures, so the model doesn't try to call them natively. Each
+        # action's own arguments are rendered from its input_schema, so a bot can add
+        # a tool taking any arguments without a change here.
         lines = []
         for tool in tools:
-            hint = " (needs tracks)" if tool.name in needs_tracks or "tracks" in (
-                tool.input_schema.get("required") or []
-            ) else ""
-            lines.append(f'- "{tool.name}"{hint}: {tool.description}')
+            lines.append(f'- "{tool.name}"{cls._render_tool_args(tool)}: {tool.description}')
         return "\n".join(lines)
+
+    @staticmethod
+    def _render_tool_args(tool: ToolSpec) -> str:
+        schema = tool.input_schema or {}
+        properties: dict[str, Any] = schema.get("properties") or {}
+        required = schema.get("required") or []
+        names = list(properties) or list(required)
+
+        hints: list[str] = []
+        for name in names:
+            if name == "tracks":
+                hints.append("needs tracks")
+                continue
+            prop = properties.get(name) or {}
+            declared = prop.get("type", "value") if isinstance(prop, dict) else "value"
+            bounds = ""
+            if isinstance(prop, dict) and "minimum" in prop and "maximum" in prop:
+                bounds = f" {prop['minimum']}-{prop['maximum']}"
+            hints.append(f"{name}=<{declared}{bounds}> in action_args_json")
+        return f" ({'; '.join(hints)})" if hints else ""
 
     # --- run -----------------------------------------------------------------
 
@@ -380,7 +429,9 @@ class AgentService:
 
         clean = True
         if isinstance(draft, ToolCallDraft) and request.tools is not None:
-            tool_calls, clean = self._build_tool_calls(draft.action, tracks, request.tools)
+            tool_calls, clean = self._build_tool_calls(
+                draft.action, tracks, request.tools, draft.action_args_json
+            )
             # The reply and the tool_calls must agree. When the action was dropped the
             # model's text still claims it happened ("Putting on some metal") — the bot
             # would speak that and play nothing, and the user believes their ears. So
@@ -424,21 +475,74 @@ class AgentService:
         who = request.session.user_name or "Unknown user"
         return f"{who}: {request.message}"
 
-    @staticmethod
+    @classmethod
     def _build_tool_calls(
-        action: str, tracks: list[Track], tools: list[ToolSpec]
+        cls,
+        action: str,
+        tracks: list[Track],
+        tools: list[ToolSpec],
+        action_args_json: str = "",
     ) -> tuple[list[ToolCall], bool]:
-        """Turn the model's single (action, tracks) into the bot's tool_calls.
-        Returns (tool_calls, clean). A hallucinated action name, or a music action
-        with no resolved tracks, yields no call and clean=False (won't be saved)."""
+        """Turn the model's single (action, tracks, args) into the bot's tool_calls.
+        Returns (tool_calls, clean). A hallucinated action name, or an action missing
+        a required argument, yields no call and clean=False (won't be saved)."""
         if not action:
             return [], True
         spec = next((t for t in tools if t.name == action), None)
         if spec is None:
             return [], False  # hallucinated action name
-        if "tracks" in (spec.input_schema.get("required") or []) and not tracks:
-            return [], False  # music action without real tracks
-        return [ToolCall(name=action, arguments=ToolArguments(tracks=tracks))], True
+        arguments, clean = cls._build_arguments(spec, tracks, action_args_json)
+        if not clean:
+            return [], False
+        return [ToolCall(name=action, arguments=arguments)], True
+
+    @classmethod
+    def _build_arguments(
+        cls, spec: ToolSpec, tracks: list[Track], action_args_json: str
+    ) -> tuple[dict[str, Any], bool]:
+        """Shape the arguments from the tool's OWN `input_schema`, so a bot can add a
+        tool with any arguments without a change here. `tracks` is the one property the
+        service owns (the model emits ids, we resolve them); everything else comes from
+        the model's flat `action_args_json`, coerced to the type the schema declares."""
+        schema = spec.input_schema or {}
+        properties: dict[str, Any] = schema.get("properties") or {}
+        required: list[str] = schema.get("required") or []
+        supplied = cls._parse_action_args(action_args_json)
+
+        arguments: dict[str, Any] = {}
+        if "tracks" in properties or "tracks" in required:
+            arguments["tracks"] = [track.model_dump() for track in tracks]
+
+        for name, prop in properties.items():
+            if name == "tracks" or name not in supplied:
+                continue
+            value = _coerce_to_schema(supplied[name], prop if isinstance(prop, dict) else {})
+            if value is not None:
+                arguments[name] = value
+
+        # A required argument we could not produce means the call would be rejected by
+        # the bot anyway — better to report honestly than to send a broken call.
+        missing = [
+            name
+            for name in required
+            if name not in arguments or (name == "tracks" and not tracks)
+        ]
+        return arguments, not missing
+
+    @staticmethod
+    def _parse_action_args(action_args_json: str) -> dict[str, Any]:
+        """The model emits arguments as a JSON object string (flat, and the same shape
+        function-calling itself uses). Anything unparseable is treated as absent — the
+        required-argument check below then reports the failure honestly."""
+        text = (action_args_json or "").strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            logger.warning("could not parse action_args_json: %r", text[:200])
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     async def forget(self, session: AgentSession) -> None:
         """Clear stored conversation memory for a session."""

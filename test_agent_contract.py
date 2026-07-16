@@ -23,9 +23,11 @@ from app.services.agent_service import AgentDeps, AgentService, clean_for_tts
 
 _ENV = {"TM_MODEL_NAME": "dummy", "TM_BASE_URL": "http://127.0.0.1:9/v1", "TM_API_KEY": "x"}
 
+_TRACKS_SCHEMA = {"type": "object", "properties": {"tracks": {"type": "array"}}, "required": ["tracks"]}
+
 TOOLS = [
-    ToolSpec(name="play", description="Play now", input_schema={"tracks": []}),
-    ToolSpec(name="enqueue", description="Add to queue", input_schema={"tracks": []}),
+    ToolSpec(name="play", description="Play now", input_schema=_TRACKS_SCHEMA),
+    ToolSpec(name="enqueue", description="Add to queue", input_schema=_TRACKS_SCHEMA),
     ToolSpec(name="pause", description="Pause", input_schema={}),
     ToolSpec(name="skip", description="Skip", input_schema={}),
 ]
@@ -56,12 +58,74 @@ class BuildToolCallsTests(unittest.TestCase):
         calls, clean = AgentService._build_tool_calls("play", [self.TRACK], self.TOOLS)
         self.assertTrue(clean)
         self.assertEqual(calls[0].name, "play")
-        self.assertEqual(calls[0].arguments.tracks[0].id, "x")
+        self.assertEqual(calls[0].arguments["tracks"][0]["id"], "x")
 
     def test_control_needs_no_tracks(self):
         calls, clean = AgentService._build_tool_calls("pause", [], self.TOOLS)
         self.assertTrue(clean)
         self.assertEqual(calls[0].name, "pause")
+
+
+class SchemaDrivenArgumentsTests(unittest.TestCase):
+    """`arguments` is shaped by the chosen tool's own input_schema, so the bot can add
+    a tool with any arguments without a change here. Nothing is hardcoded per tool."""
+
+    SET_VOLUME = ToolSpec(
+        name="set_volume",
+        description="Set the volume to an exact level on a 1-10 scale.",
+        input_schema={
+            "type": "object",
+            "properties": {"level": {"type": "integer", "minimum": 1, "maximum": 10}},
+            "required": ["level"],
+        },
+    )
+    PLAY = ToolSpec(
+        name="play",
+        input_schema={"type": "object", "properties": {"tracks": {"type": "array"}}, "required": ["tracks"]},
+    )
+    PAUSE = ToolSpec(name="pause", input_schema={})
+    TOOLS = [SET_VOLUME, PLAY, PAUSE]
+
+    def _call(self, action, tracks=(), args_json=""):
+        return AgentService._build_tool_calls(action, list(tracks), self.TOOLS, args_json)
+
+    def test_scalar_argument_is_passed_through(self):
+        calls, clean = self._call("set_volume", args_json='{"level": 6}')
+        self.assertTrue(clean)
+        self.assertEqual(calls[0].arguments, {"level": 6})
+
+    def test_argument_is_coerced_to_declared_type(self):
+        # The model is loose about types ("1" vs 1); the bot validates against schema.
+        calls, clean = self._call("set_volume", args_json='{"level": "1"}')
+        self.assertTrue(clean)
+        self.assertEqual(calls[0].arguments, {"level": 1})
+
+    def test_missing_required_argument_is_dirty(self):
+        calls, clean = self._call("set_volume", args_json="")
+        self.assertEqual(calls, [])
+        self.assertFalse(clean)
+
+    def test_unparseable_args_are_dirty_not_crashing(self):
+        calls, clean = self._call("set_volume", args_json="level 6")
+        self.assertEqual(calls, [])
+        self.assertFalse(clean)
+
+    def test_track_tool_still_gets_tracks_and_no_stray_args(self):
+        calls, clean = self._call("play", tracks=[Track(id="x", title="t")], args_json='{"level": 6}')
+        self.assertTrue(clean)
+        self.assertEqual(list(calls[0].arguments), ["tracks"])  # `level` is not in play's schema
+        self.assertEqual(calls[0].arguments["tracks"][0]["id"], "x")
+
+    def test_argumentless_tool_gets_empty_arguments(self):
+        calls, clean = self._call("pause")
+        self.assertTrue(clean)
+        self.assertEqual(calls[0].arguments, {})
+
+    def test_rendered_tools_expose_the_argument_schema(self):
+        rendered = AgentService._render_tools(self.TOOLS)
+        self.assertIn("level=<integer 1-10>", rendered)
+        self.assertIn("needs tracks", rendered)
+        self.assertIn('"pause"', rendered)
 
 
 class _AgentRunHarness(unittest.IsolatedAsyncioTestCase):
@@ -106,7 +170,7 @@ class DirtyTurnNotSavedTests(_AgentRunHarness):
         save, resp = await self._run(draft, tools, found={"a": Track(id="a", title="Song")})
         save.assert_called_once()
         self.assertEqual(resp.tool_calls[0].name, "play")
-        self.assertEqual(resp.tool_calls[0].arguments.tracks[0].title, "Song")
+        self.assertEqual(resp.tool_calls[0].arguments["tracks"][0]["title"], "Song")
 
     async def test_invented_id_dropped(self):
         tools = [ToolSpec(name="play", input_schema={"required": ["tracks"]})]
@@ -382,7 +446,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         build_legacy.assert_not_called()
         self.assertIsInstance(out, ToolCallResponse)
         self.assertEqual(out.tool_calls[0].name, "enqueue")
-        self.assertEqual(out.tool_calls[0].arguments.tracks[0].id, "a")
+        self.assertEqual(out.tool_calls[0].arguments["tracks"][0]["id"], "a")
         self.assertEqual(out.spoken_answer, "ok")  # derived from display_text
 
     async def test_no_tools_uses_legacy_agent(self):

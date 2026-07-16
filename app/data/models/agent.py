@@ -41,17 +41,14 @@ class AgentRequest(BaseModel):
     )
 
 
-class ToolArguments(BaseModel):
-    """Arguments for a bot action in the response. Built by the service from the
-    model's chosen track ids, so it can carry full tracks (the LLM never generates
-    this nested shape — it only emits flat id strings)."""
-
-    tracks: list[Track] = Field(default_factory=list)
-
-
 class ToolCall(BaseModel):
     name: str = Field(description="Name of a bot action to invoke; one of the request's tools.")
-    arguments: ToolArguments = Field(default_factory=ToolArguments)
+    arguments: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Arguments shaped by the tool's own `input_schema`, built by the "
+        "service — NOT a fixed shape. `tracks` is filled from the model's track ids; "
+        "any other property comes from the model's `action_args_json`.",
+    )
 
 
 # --- LLM output (drafts) -------------------------------------------------------
@@ -69,6 +66,12 @@ class ToolCallDraft(BaseModel):
     track_ids: list[str] = Field(
         default_factory=list,
         description="Ids (from search results) to act on. Only for actions that take tracks.",
+    )
+    action_args_json: str = Field(
+        default="",
+        description="The action's NON-track arguments as a flat JSON object string, "
+        'e.g. {"level": 6}. Use the argument names from the action\'s listed schema. '
+        'Empty ("") when the action takes no arguments or only takes tracks.',
     )
     clarification: str | None = Field(default=None, description="A follow-up question if one is needed.")
 
