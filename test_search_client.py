@@ -83,11 +83,13 @@ class DiscoveryClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tracks, [])
         self.assertNotIn("track", self.requests[0].url.params)
 
-    async def test_similar_error_status_raises(self):
+    async def test_similar_error_status_degrades_to_empty(self):
+        # These run as agent tools: a raised error propagates out of /agent as a 500
+        # and the bot speaks nothing at all. Degrade instead, so the agent can try
+        # another tool and the response guard can answer honestly.
         handler = self._handler({"detail": "Last.fm key not configured"}, status=503)
         with _mock_client(handler):
-            with self.assertRaises(httpx.HTTPStatusError):
-                await SearchClient().similar("Daft Punk")
+            self.assertEqual(await SearchClient().similar("Daft Punk"), [])
 
     # --- charts() ------------------------------------------------------------
 
@@ -119,11 +121,26 @@ class DiscoveryClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tracks, [])
         self.assertEqual(self.requests[0].url.params["country"], "Japan")
 
-    async def test_charts_upstream_error_raises(self):
+    async def test_charts_upstream_error_degrades_to_empty(self):
+        # The live symptom this guards: /charts and /similar 502 while /search is
+        # fine, which used to turn one dead dependency into a failed /agent request.
         handler = self._handler({"detail": "provider failure"}, status=502)
         with _mock_client(handler):
-            with self.assertRaises(httpx.HTTPStatusError):
-                await SearchClient().charts(tag="rock")
+            self.assertEqual(await SearchClient().charts(tag="rock"), [])
+
+    async def test_unreachable_service_degrades_to_empty(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused", request=request)
+
+        with _mock_client(handler):
+            self.assertEqual(await SearchClient().search("metal"), [])
+
+    async def test_malformed_entry_does_not_lose_the_rest(self):
+        handler = self._handler({"results": [{"no_id": True}, *SAMPLE_RESULTS]})
+        with _mock_client(handler):
+            tracks = await SearchClient().search("metal")
+
+        self.assertEqual([t.id for t in tracks], ["abc123", "def456"])
 
 
 class ToolWiringSmokeTest(unittest.TestCase):
