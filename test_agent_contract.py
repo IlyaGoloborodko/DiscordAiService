@@ -234,6 +234,50 @@ class DurationFilterTests(unittest.TestCase):
             self.assertEqual([t.id for t in deps.remember([mix])], ["m"])
 
 
+class RestingFilterTests(unittest.TestCase):
+    """Tracks that played recently are hidden from the model — unless hiding them
+    would leave it with nothing to offer."""
+
+    SONG = Track(id="a", title="Song", duration=200.0)
+    OTHER = Track(id="b", title="Other", duration=210.0)
+    MIX = Track(id="m", title="1 HOUR PHONK MIX", duration=3600.0)
+
+    def test_resting_track_is_hidden(self):
+        deps = AgentDeps(search=None, resting={"a"})
+        with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
+            kept = deps.remember([self.SONG, self.OTHER])
+        self.assertEqual([t.id for t in kept], ["b"])
+        self.assertNotIn("a", deps.found)
+
+    def test_all_resting_falls_back_to_repeating(self):
+        # Real case: a "phonk" search is nearly all hour-long mixes, so once the
+        # few real tracks have played there is nothing left. Repeating beats
+        # telling the user we found nothing.
+        deps = AgentDeps(search=None, resting={"a", "b"})
+        with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
+            kept = deps.remember([self.SONG, self.OTHER])
+        self.assertEqual([t.id for t in kept], ["a", "b"])
+
+    def test_fallback_never_lets_long_mixes_through(self):
+        # The length filter is a hard rule: an hour-long mix breaks the queue.
+        deps = AgentDeps(search=None, resting={"a"})
+        with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
+            kept = deps.remember([self.SONG, self.MIX])
+        self.assertEqual([t.id for t in kept], ["a"])  # fell back, but no mix
+
+    def test_recently_played_tool_ignores_resting(self):
+        deps = AgentDeps(search=None, resting={"a"})
+        with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
+            kept = deps.remember([self.SONG], include_resting=True)
+        self.assertEqual([t.id for t in kept], ["a"])
+
+    def test_source_query_is_recorded(self):
+        deps = AgentDeps(search=None)
+        with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
+            deps.remember([self.SONG], "phonk")
+        self.assertEqual(deps.source_queries["a"], "phonk")
+
+
 class ChartsFallbackTests(unittest.IsolatedAsyncioTestCase):
     """A non-English tag returns nothing from the chart source; the tool must fall
     back to a plain search rather than hand the model an empty list."""

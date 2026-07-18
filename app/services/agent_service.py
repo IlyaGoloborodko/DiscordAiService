@@ -35,6 +35,8 @@ from app.data.models import (
     ToolSpec,
     Track,
 )
+from app.recommendations import cooldown, sampling
+from app.recommendations import history as play_history
 from app.services.memory import MemoryStore
 from app.services.search_client import SearchClient
 
@@ -237,13 +239,41 @@ class AgentDeps:
     # model answer "continue the previous playlist" — the Discord bot forgets its
     # queue on restart, so the service is the only place this survives.
     recent: list[Track] = field(default_factory=list)
+    # Tracks that played recently enough to still be resting (see recommendations
+    # .cooldown). Hidden from the model so it cannot pick them at all.
+    resting: set[str] = field(default_factory=set)
+    # Which search query produced each track, so the history can record a rough
+    # genre for it ("metal", "phonk") until real tags exist.
+    source_queries: dict[str, str] = field(default_factory=dict)
 
-    def remember(self, tracks: list[Track]) -> list[Track]:
-        """Cache what the search tools found, dropping over-long compilations so the
-        model can neither see nor pick them."""
-        keep = [track for track in tracks if fits_duration(track)]
+    def remember(
+        self, tracks: list[Track], query: str = "", include_resting: bool = False
+    ) -> list[Track]:
+        """Cache what a search tool found and return what the model may use.
+
+        Two kinds of track never make it through: hour-long compilations, and
+        tracks that are still resting after playing recently. `include_resting`
+        is for the one tool that deliberately returns recent tracks.
+        """
+        real_tracks = [track for track in tracks if fits_duration(track)]
+        keep = (
+            real_tracks
+            if include_resting
+            else [track for track in real_tracks if track.id not in self.resting]
+        )
+        # Some genres are almost entirely hour-long mixes — a search for "phonk"
+        # comes back with 25 results of which 4 are actual songs. Once those four
+        # have played, resting them all would leave nothing at all, and the user
+        # would be told we found nothing. Hearing a track again is better than
+        # that, so when the rest empties the list we ignore it. The length filter
+        # is never relaxed: an hour-long mix breaks the player's queue.
+        if not keep and real_tracks:
+            logger.info("all %d candidates were resting; letting them through", len(real_tracks))
+            keep = real_tracks
         for track in keep:
             self.found[track.id] = track
+            if query and track.id not in self.source_queries:
+                self.source_queries[track.id] = query
         return keep
 
 
@@ -274,14 +304,17 @@ class AgentService:
             ctx: RunContext[AgentDeps], query: str, limit: int = 10
         ) -> list[Track]:
             """Search for tracks by a free-text query (artist, track, genre, mood)."""
-            return ctx.deps.remember(await ctx.deps.search.search(query, limit))
+            found = await ctx.deps.search.search(query, sampling.pool_size(limit))
+            return sampling.pick_varied(ctx.deps.remember(found, query), limit)
 
         @agent.tool
         async def get_playlist_tracks(
             ctx: RunContext[AgentDeps], url: str, limit: int = 50
         ) -> list[Track]:
             """Expand a YouTube playlist (URL or bare playlist id) into its tracks."""
-            return ctx.deps.remember(await ctx.deps.search.playlist(url, limit))
+            # A playlist is an explicit, ordered thing the user asked for — take it
+            # as it comes instead of sampling it.
+            return ctx.deps.remember(await ctx.deps.search.playlist(url, limit), url)
 
         @agent.tool
         async def get_similar_tracks(
@@ -293,14 +326,19 @@ class AgentService:
             """Recommend tracks in the style of an artist. Always pass a seed
             `track` too (a well-known song by that artist) — the recommendation
             source needs both."""
-            return ctx.deps.remember(await ctx.deps.search.similar(artist, track or None, limit))
+            found = await ctx.deps.search.similar(
+                artist, track or None, sampling.pool_size(limit)
+            )
+            return sampling.pick_varied(ctx.deps.remember(found, artist), limit)
 
         @agent.tool
         async def get_recently_played(ctx: RunContext[AgentDeps], limit: int = 20) -> list[Track]:
             """Tracks this session played recently, newest first. Use for "continue
             the previous playlist", "put that back on", "what were we listening to" —
             these refer to real earlier tracks, so return them instead of searching."""
-            return ctx.deps.remember(ctx.deps.recent[:limit])
+            # These tracks are recent by definition, so they are all resting. The
+            # user asked for them by name, so the rest does not apply here.
+            return ctx.deps.remember(ctx.deps.recent[:limit], include_resting=True)
 
         @agent.tool
         async def get_top_charts(
@@ -313,15 +351,16 @@ class AgentService:
             English word — the chart source only indexes English tags, so translate
             the user's genre first ("металл" -> "metal"). `country` when the user
             names one; omit both for the global top."""
-            tracks = await ctx.deps.search.charts(tag or None, country or None, limit)
+            pool = sampling.pool_size(limit)
+            tracks = await ctx.deps.search.charts(tag or None, country or None, pool)
             if not tracks and tag:
                 # The chart source only knows English tags, so a non-English or
                 # obscure one returns nothing. Fall back to a plain search instead of
                 # handing back an empty list: on empty the model either gives up
                 # (action set, no track ids) or silently retries with no tag at all,
                 # which is the global top — pop/hip-hop regardless of what was asked.
-                tracks = await ctx.deps.search.search(tag, limit)
-            return ctx.deps.remember(tracks)
+                tracks = await ctx.deps.search.search(tag, pool)
+            return sampling.pick_varied(ctx.deps.remember(tracks, tag or country), limit)
 
     # The system prompt is injected fresh into message_history each run (see run),
     # not set on the Agent — so it can never be lost when memory trims history and
@@ -430,7 +469,11 @@ class AgentService:
         session_key = self._session_key(request)
         intermediate = await self.memory.load(session_key)
         recent = [Track(**data) for data in await self.memory.load_tracks(session_key)]
-        deps = AgentDeps(search=SearchClient(), recent=recent)
+        # Tracks this server heard recently enough that they should sit this one
+        # out. Loaded once per run and hidden from the model in `remember`.
+        guild_id = request.session.guild_id or ""
+        resting = cooldown.resting_track_ids(await play_history.load_play_stats(guild_id))
+        deps = AgentDeps(search=SearchClient(), recent=recent, resting=resting)
 
         if request.tools:
             agent: Agent[AgentDeps, object] = self._build_toolcall_agent()
@@ -506,6 +549,15 @@ class AgentService:
             if tracks:
                 await self.memory.save_tracks(
                     session_key, [track.model_dump() for track in tracks]
+                )
+                # ...and write it to the durable listening history, which is what
+                # decides how long each track rests before it can play again.
+                await play_history.record_plays(
+                    guild_id=guild_id,
+                    user_id=request.session.user_id,
+                    tracks=tracks,
+                    action=draft.action or "",
+                    source_queries=deps.source_queries,
                 )
 
         return response

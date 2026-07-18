@@ -2,7 +2,7 @@ import os
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import TIMESTAMP, Text, func
+from sqlalchemy import TIMESTAMP, BigInteger, Index, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -34,6 +34,47 @@ class SessionMemory(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+
+class PlayEvent(Base):
+    """One track that was actually sent to the player, with who asked for it.
+
+    This is the durable listening history. It answers "how often has this played
+    and when was the last time" (used to rest a track for a while before it can
+    play again), and later "what does this server like" for recommendations.
+
+    Written when a track is DELIVERED to the bot, not when search finds it — a
+    track nobody heard should not count as taste.
+    """
+
+    __tablename__ = "play_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    guild_id: Mapped[str] = mapped_column(Text, nullable=False)
+    user_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    track_id: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    uploader: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The search query this track came from ("metal", "phonk"). A rough stand-in
+    # for genre until the search service can give us real Last.fm tags.
+    source_query: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # play / enqueue / replace_queue — how it reached the player.
+    action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    played_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
+    )
+    # How long it was actually listened to. Nothing fills this in yet; it exists
+    # so that switching from "times played" to "minutes listened" later needs no
+    # second migration.
+    played_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        # "has this track played recently, and how often" — the cooldown lookup.
+        Index("ix_play_events_guild_track_time", "guild_id", "track_id", "played_at"),
+        # "what has this server been listening to lately" — taste profiles later.
+        Index("ix_play_events_guild_time", "guild_id", "played_at"),
     )
 
 
