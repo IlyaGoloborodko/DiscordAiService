@@ -69,6 +69,13 @@ pass the artist AND a representative seed track; both are needed.
 - `get_recently_played()`: the user refers to what was already on ("продолжи прошлый \
 плейлист", "верни то же", "что мы слушали"). Prefer it over searching — it returns the \
 actual earlier tracks. If it comes back empty, say so instead of inventing a playlist.
+
+When the user asks for MORE of something already playing, or explicitly for something \
+NEW / different / "не повторяй" — call `get_recently_played()` FIRST, then pick only \
+ids that are NOT in that list. Searching the same genre twice returns the same popular \
+hits, so without checking you will hand back tracks they just heard. If everything you \
+found was already played, search again with a narrower or different query (a sub-genre, \
+another artist) rather than repeating.
 - `get_top_charts(tag, country)`: "what's popular / trending" or "an hour of \
 <genre>/<mood>" — `tag` for a genre or mood, `country` when named; omit both for the global top.
 
