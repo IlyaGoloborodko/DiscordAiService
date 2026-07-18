@@ -234,6 +234,47 @@ class DurationFilterTests(unittest.TestCase):
             self.assertEqual([t.id for t in deps.remember([mix])], ["m"])
 
 
+class SilentCommandTests(_AgentRunHarness):
+    """Controls are carried out without a spoken line: you hear pause/skip/volume
+    happen, so announcing them first only delays the thing that was asked for."""
+
+    VOLUME = ToolSpec(
+        name="set_volume",
+        input_schema={"type": "object", "properties": {"level": {"type": "integer"}}, "required": ["level"]},
+    )
+    PAUSE = ToolSpec(name="pause", input_schema={})
+    PLAY = ToolSpec(
+        name="play",
+        input_schema={"type": "object", "properties": {"tracks": {"type": "array"}}, "required": ["tracks"]},
+    )
+    TOOLS = [VOLUME, PAUSE, PLAY]
+
+    async def test_pause_is_not_spoken(self):
+        draft = ToolCallDraft(display_text="Ставлю на паузу", action="pause")
+        _, resp = await self._run(draft, self.TOOLS)
+        self.assertEqual(resp.tool_calls[0].name, "pause")
+        self.assertEqual(resp.spoken_answer, "")
+        self.assertEqual(resp.display_text, "Ставлю на паузу")  # chat still gets it
+
+    async def test_volume_is_not_spoken(self):
+        draft = ToolCallDraft(display_text="Делаю громче", action="set_volume", action_args_json='{"level": 6}')
+        _, resp = await self._run(draft, self.TOOLS)
+        self.assertEqual(resp.tool_calls[0].arguments, {"level": 6})
+        self.assertEqual(resp.spoken_answer, "")
+
+    async def test_playing_music_is_still_spoken(self):
+        draft = ToolCallDraft(display_text="Включаю метал", action="play", track_ids=["a"])
+        _, resp = await self._run(draft, self.TOOLS, found={"a": Track(id="a", title="Song")})
+        self.assertEqual(resp.spoken_answer, "Включаю метал")
+
+    async def test_answering_a_question_is_still_spoken(self):
+        # No tool call at all — this is conversation, and must be heard.
+        draft = ToolCallDraft(display_text="Сейчас громкость 5")
+        _, resp = await self._run(draft, self.TOOLS)
+        self.assertEqual(resp.tool_calls, [])
+        self.assertEqual(resp.spoken_answer, "Сейчас громкость 5")
+
+
 class RestingFilterTests(unittest.TestCase):
     """Tracks that played recently are hidden from the model — unless hiding them
     would leave it with nothing to offer."""

@@ -203,6 +203,21 @@ _DEFAULT_ACTION_FAILED = (
 )
 
 
+def _is_silent_command(tool_calls: list[ToolCall]) -> bool:
+    """Whether this turn is a plain control the bot should just do, without talking.
+
+    Pause, resume, skip, stop and the volume actions all produce an instant,
+    obvious result — the listener hears it happen. Announcing it first only adds
+    the text-to-speech delay in front of the thing they asked for.
+
+    A command is anything that acts without tracks. Deciding it that way rather
+    than by listing names means a control the bot adds later is silent too,
+    without a change here. Answering a question ("what's the volume?") makes no
+    tool call at all, so it still gets spoken.
+    """
+    return bool(tool_calls) and all(not call.arguments.get("tracks") for call in tool_calls)
+
+
 def _coerce_to_schema(value: Any, prop: dict[str, Any]) -> Any:
     """Coerce a model-supplied argument to the JSON-schema type the bot declared.
     The model reliably picks the right value but is loose about its type ("6" vs 6),
@@ -516,8 +531,12 @@ class AgentService:
             # would speak that and play nothing, and the user believes their ears. So
             # replace the text rather than let it lie.
             text = draft.display_text if clean else self._action_failed_text()
+            # Pause, skip and volume speak for themselves — you hear the result
+            # immediately, so reading a line out first is just a delay before it.
+            # The chat message still goes out; only the voice is skipped.
+            spoken = "" if _is_silent_command(tool_calls) else clean_for_tts(text)
             response: AgentResponse | ToolCallResponse = ToolCallResponse(
-                spoken_answer=clean_for_tts(text),
+                spoken_answer=spoken,
                 display_text=text,
                 clarification=draft.clarification,
                 tool_calls=tool_calls,
