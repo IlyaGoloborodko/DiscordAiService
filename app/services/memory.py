@@ -46,10 +46,16 @@ class MemoryStore:
         # fresh by the agent) and the latest user message are never part of this
         # and are never trimmed.
         self.token_limit = int(os.getenv("HISTORY_TOKEN_LIMIT", "20000"))
+        # How many recently played tracks to keep per session (see save_tracks).
+        self.track_limit = int(os.getenv("RECENT_TRACKS_LIMIT", "20"))
 
     @staticmethod
     def _rkey(session_key: str) -> str:
         return f"sess:{session_key}"
+
+    @staticmethod
+    def _tkey(session_key: str) -> str:
+        return f"tracks:{session_key}"
 
     async def load(self, session_key: str) -> list[ModelMessage]:
         raw = await self._load_redis(session_key)
@@ -72,10 +78,70 @@ class MemoryStore:
         await self._cache_redis(session_key, raw)
         await self._save_pg(session_key, payload)
 
+    # --- recently played tracks ----------------------------------------------
+
+    async def load_tracks(self, session_key: str) -> list[dict[str, Any]]:
+        """Recently played tracks for a session, newest first. Best-effort."""
+        try:
+            raw = await get_redis().get(self._tkey(session_key))
+            if raw is not None:
+                return json.loads(raw)
+        except Exception:
+            logger.warning("redis track load failed for %s", session_key, exc_info=True)
+        try:
+            async with get_sessionmaker()() as session:
+                row = await session.get(SessionMemory, session_key)
+            return list(row.recent_tracks or []) if row is not None else []
+        except Exception:
+            logger.warning("postgres track load failed for %s", session_key, exc_info=True)
+            return []
+
+    @staticmethod
+    def _merge_recent(
+        played: list[dict[str, Any]], existing: list[dict[str, Any]], limit: int
+    ) -> list[dict[str, Any]]:
+        """Just-played tracks first, then the previous tail; de-duplicated by id and
+        capped at `limit`. Tracks without an id are unusable downstream and dropped."""
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for track in [*played, *existing]:
+            track_id = track.get("id")
+            if not track_id or track_id in seen:
+                continue
+            seen.add(track_id)
+            merged.append(track)
+            if len(merged) >= limit:
+                break
+        return merged
+
+    async def save_tracks(self, session_key: str, played: list[dict[str, Any]]) -> None:
+        """Prepend just-played tracks to the session's recent list, de-duplicated by
+        id and capped: this is a short 'what was on' tail for "continue the playlist",
+        not a play history, so it must not grow without bound."""
+        merged = self._merge_recent(played, await self.load_tracks(session_key), self.track_limit)
+        raw = json.dumps(merged).encode()
+        try:
+            await get_redis().set(self._tkey(session_key), raw, ex=self.TTL_SECONDS)
+        except Exception:
+            logger.warning("redis track save failed for %s", session_key, exc_info=True)
+        try:
+            stmt = pg_insert(SessionMemory).values(
+                session_key=session_key, messages=[], recent_tracks=merged
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[SessionMemory.session_key],
+                set_={"recent_tracks": merged, "updated_at": func.now()},
+            )
+            async with get_sessionmaker()() as session:
+                await session.execute(stmt)
+                await session.commit()
+        except Exception:
+            logger.warning("postgres track save failed for %s", session_key, exc_info=True)
+
     async def clear(self, session_key: str) -> None:
         """Forget a session's history in both stores (best-effort)."""
         try:
-            await get_redis().delete(self._rkey(session_key))
+            await get_redis().delete(self._rkey(session_key), self._tkey(session_key))
         except Exception:
             logger.warning("redis clear failed for %s", session_key, exc_info=True)
         try:

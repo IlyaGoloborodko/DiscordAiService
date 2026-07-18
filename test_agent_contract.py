@@ -273,6 +273,34 @@ class ChartsFallbackTests(unittest.IsolatedAsyncioTestCase):
         search.search.assert_not_awaited()
 
 
+class RecentTracksTests(unittest.TestCase):
+    """Recently played tracks are a short, de-duplicated tail — not a play history."""
+
+    @staticmethod
+    def _merge(played, existing, limit=3):
+        from app.services.memory import MemoryStore
+
+        return [t["id"] for t in MemoryStore._merge_recent(played, existing, limit)]
+
+    def test_newest_first_and_capped(self):
+        merged = self._merge([{"id": "a"}], [{"id": "b"}, {"id": "c"}, {"id": "d"}])
+        self.assertEqual(merged, ["a", "b", "c"])  # "d" falls off the tail
+
+    def test_replayed_track_is_not_duplicated(self):
+        merged = self._merge([{"id": "b"}], [{"id": "a"}, {"id": "b"}])
+        self.assertEqual(merged, ["b", "a"])
+
+    def test_tracks_without_id_are_skipped(self):
+        # An id-less track cannot be replayed, so keeping it would waste the cap.
+        self.assertEqual(self._merge([{"title": "no id"}, {"id": "a"}], []), ["a"])
+
+    def test_limit_is_configurable(self):
+        with mock.patch.dict(os.environ, {"RECENT_TRACKS_LIMIT": "7"}):
+            from app.services.memory import MemoryStore
+
+            self.assertEqual(MemoryStore().track_limit, 7)
+
+
 class MemoryTrimTests(unittest.TestCase):
     """Intermediate history is bounded by a token budget; system prompt and the
     latest message are handled elsewhere and never part of this."""

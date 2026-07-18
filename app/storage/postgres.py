@@ -24,6 +24,11 @@ class SessionMemory(Base):
 
     session_key: Mapped[str] = mapped_column(Text, primary_key=True)
     messages: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    # Recently played tracks, newest first, capped. Kept in its own column rather
+    # than inside `messages`: the conversation history holds only clean text turns
+    # (see AgentService.run), and the Discord bot loses its queue on restart, so the
+    # service is the only place "what was playing" can survive.
+    recent_tracks: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default="[]")
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         server_default=func.now(),

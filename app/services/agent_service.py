@@ -66,6 +66,9 @@ invent track ids. Pick the most fitting tool:
 - `get_playlist_tracks(url)`: the user gives a playlist link or asks for a specific playlist.
 - `get_similar_tracks(artist, track)`: "something like X" / "in the style of X" — \
 pass the artist AND a representative seed track; both are needed.
+- `get_recently_played()`: the user refers to what was already on ("продолжи прошлый \
+плейлист", "верни то же", "что мы слушали"). Prefer it over searching — it returns the \
+actual earlier tracks. If it comes back empty, say so instead of inventing a playlist.
 - `get_top_charts(tag, country)`: "what's popular / trending" or "an hour of \
 <genre>/<mood>" — `tag` for a genre or mood, `country` when named; omit both for the global top.
 
@@ -209,6 +212,10 @@ class AgentDeps:
     # Tracks returned by the search tools this run, keyed by id. The model outputs
     # only ids; we resolve them back to full tracks here (and drop invented ids).
     found: dict[str, Track] = field(default_factory=dict)
+    # What this session played recently (newest first), loaded from memory. Lets the
+    # model answer "continue the previous playlist" — the Discord bot forgets its
+    # queue on restart, so the service is the only place this survives.
+    recent: list[Track] = field(default_factory=list)
 
     def remember(self, tracks: list[Track]) -> list[Track]:
         """Cache what the search tools found, dropping over-long compilations so the
@@ -266,6 +273,13 @@ class AgentService:
             `track` too (a well-known song by that artist) — the recommendation
             source needs both."""
             return ctx.deps.remember(await ctx.deps.search.similar(artist, track or None, limit))
+
+        @agent.tool
+        async def get_recently_played(ctx: RunContext[AgentDeps], limit: int = 20) -> list[Track]:
+            """Tracks this session played recently, newest first. Use for "continue
+            the previous playlist", "put that back on", "what were we listening to" —
+            these refer to real earlier tracks, so return them instead of searching."""
+            return ctx.deps.remember(ctx.deps.recent[:limit])
 
         @agent.tool
         async def get_top_charts(
@@ -392,9 +406,10 @@ class AgentService:
     # --- run -----------------------------------------------------------------
 
     async def run(self, request: AgentRequest) -> AgentResponse | ToolCallResponse:
-        deps = AgentDeps(search=SearchClient())
         session_key = self._session_key(request)
         intermediate = await self.memory.load(session_key)
+        recent = [Track(**data) for data in await self.memory.load_tracks(session_key)]
+        deps = AgentDeps(search=SearchClient(), recent=recent)
 
         if request.tools:
             agent: Agent[AgentDeps, object] = self._build_toolcall_agent()
@@ -465,6 +480,12 @@ class AgentService:
                 ModelResponse(parts=[TextPart(content=draft.display_text)]),
             ]
             await self.memory.save(session_key, [*intermediate, *turn])
+            # Remember what actually went to the player, so a later "continue the
+            # previous playlist" has real tracks to return.
+            if tracks:
+                await self.memory.save_tracks(
+                    session_key, [track.model_dump() for track in tracks]
+                )
 
         return response
 
