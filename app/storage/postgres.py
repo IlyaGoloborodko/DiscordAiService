@@ -65,10 +65,19 @@ class PlayEvent(Base):
     played_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
     )
-    # How long it was actually listened to. Nothing fills this in yet; it exists
-    # so that switching from "times played" to "minutes listened" later needs no
-    # second migration.
+    # How long the track was actually listened to, reported by the bot once it
+    # stops playing. NULL means "we handed this over but never heard back" — it
+    # was queued and probably never reached the speakers.
+    #
+    # This is the line between the two signals: every row counts for "don't offer
+    # this again right now", but only rows with played_ms count as taste.
     played_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Full length of the track, so the share actually listened to can be worked
+    # out later. Not used yet.
+    duration_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # finished / skipped / stopped / disconnected — stored as-is. Deliberately not
+    # interpreted: a skip does not mean dislike, people skip songs they love.
+    played_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         # "has this track played recently, and how often" — the cooldown lookup.

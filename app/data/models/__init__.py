@@ -4,6 +4,8 @@ from .ai_response_models import MusicAgentOutput
 
 from .track import Track
 
+from .playback import PlaybackReport
+
 from .agent import (
     AgentAction,
     AgentSession,

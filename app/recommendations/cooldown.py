@@ -15,7 +15,12 @@ from app.recommendations import settings
 
 @dataclass
 class PlayStat:
-    """How well we already know one track: how often it played and when last."""
+    """How well we already know one track.
+
+    `play_count` counts only times it was actually HEARD — that is what makes
+    people tired of a song. `last_played_at` is the last time we handed it to the
+    player at all, heard or not, so we don't queue the same track twice.
+    """
 
     play_count: int
     last_played_at: datetime
@@ -34,12 +39,18 @@ def rest_hours(play_count: int) -> float:
 
 
 def is_resting(stat: PlayStat, now: datetime | None = None) -> bool:
-    """True if this track played too recently and should sit this one out."""
+    """True if this track went out too recently and should sit this one out.
+
+    A track we handed over but never heard back about still gets the shortest
+    rest — it may be sitting in the queue right now, and offering it again would
+    put it there twice. It just doesn't get the longer, growing rest that comes
+    from actually listening to something over and over.
+    """
     now = now or datetime.now(timezone.utc)
     last = stat.last_played_at
     if last.tzinfo is None:
         last = last.replace(tzinfo=timezone.utc)
-    return now - last < timedelta(hours=rest_hours(stat.play_count))
+    return now - last < timedelta(hours=rest_hours(max(1, stat.play_count)))
 
 
 def resting_track_ids(stats: dict[str, PlayStat], now: datetime | None = None) -> set[str]:

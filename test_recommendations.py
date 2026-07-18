@@ -73,6 +73,17 @@ class RestingTests(unittest.TestCase):
         with mock.patch.dict(os.environ, _COOLDOWN_ENV):
             self.assertTrue(is_resting(PlayStat(1, naive)))
 
+    def test_queued_but_never_heard_gets_only_the_short_rest(self):
+        # The listener was handed 5 tracks and heard 2. The other 3 must not be
+        # pushed away as if they had been listened to — but they still rest
+        # briefly, because they may be sitting in the queue right now.
+        never_heard = PlayStat(play_count=0, last_played_at=_hours_ago(1))
+        with mock.patch.dict(os.environ, _COOLDOWN_ENV):
+            self.assertTrue(is_resting(never_heard))                     # 1h < 6h
+            self.assertFalse(is_resting(PlayStat(0, _hours_ago(7))))     # 7h > 6h
+            # ...while a track heard three times is still resting at 7 hours.
+            self.assertTrue(is_resting(PlayStat(3, _hours_ago(7))))
+
     def test_picks_out_only_the_resting_ones(self):
         stats = {
             "fresh": PlayStat(1, _hours_ago(1)),   # played an hour ago -> resting

@@ -56,6 +56,58 @@ async def record_plays(
         logger.warning("could not record %d plays for %s", len(rows), guild_id, exc_info=True)
 
 
+async def confirm_play(
+    guild_id: str,
+    track_id: str,
+    played_ms: int,
+    duration_ms: int | None = None,
+    reason: str | None = None,
+    provider: str | None = None,
+) -> None:
+    """Mark that a track we handed over was actually heard, and for how long.
+
+    Fills in the newest row for this track that is still waiting for confirmation.
+    If there isn't one, the track was played without us — someone used the bot's
+    own commands instead of asking Marina — and we write a fresh row. That is
+    real listening either way, and arguably the most honest kind.
+    """
+    if not guild_id or not track_id or played_ms <= 0:
+        return
+
+    waiting = (
+        select(PlayEvent)
+        .where(
+            PlayEvent.guild_id == guild_id,
+            PlayEvent.track_id == track_id,
+            PlayEvent.played_ms.is_(None),
+        )
+        .order_by(PlayEvent.played_at.desc())
+        .limit(1)
+    )
+
+    try:
+        async with get_sessionmaker()() as session:
+            row = (await session.execute(waiting)).scalar_one_or_none()
+            if row is None:
+                # Played outside of Marina, or this track has already been
+                # confirmed once and is now playing again — either way, a new
+                # listen deserves its own row.
+                row = PlayEvent(
+                    guild_id=guild_id,
+                    track_id=track_id,
+                    title=track_id,
+                    provider=provider,
+                    action="external",
+                )
+                session.add(row)
+            row.played_ms = played_ms
+            row.duration_ms = duration_ms
+            row.played_reason = reason
+            await session.commit()
+    except Exception:
+        logger.warning("could not confirm play of %s in %s", track_id, guild_id, exc_info=True)
+
+
 async def load_play_stats(guild_id: str) -> dict[str, PlayStat]:
     """How often each track has played on this server, and when it last did.
 
@@ -70,7 +122,12 @@ async def load_play_stats(guild_id: str) -> dict[str, PlayStat]:
     query = (
         select(
             PlayEvent.track_id,
-            func.count().label("play_count"),
+            # Only tracks we know were HEARD make the rest grow. A track that sat
+            # in the queue and never reached the speakers shouldn't be pushed away
+            # for days — nobody got tired of it.
+            func.count(PlayEvent.played_ms).label("play_count"),
+            # ...but the clock runs from the last time we handed it over, heard or
+            # not, so we don't put the same track in the queue twice.
             func.max(PlayEvent.played_at).label("last_played_at"),
         )
         .where(PlayEvent.guild_id == guild_id)
