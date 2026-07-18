@@ -117,7 +117,12 @@ names, e.g. an action listed as `level=<integer 1-10>` -> `action_args_json` =
 
 Rules:
 - Controls (pause/resume/skip/stop/...): set `action` to that name, `track_ids` empty.
-- Questions about what's playing / the queue: answer in `display_text`, action "", track_ids empty.
+- The "Current player state" block in the user message is the AUTHORITATIVE live state
+  of the player. Questions about it ("какая громкость", "что играет", "что дальше")
+  are answered directly from those values, with action "" and no tools — the tools
+  only CHANGE state, they cannot read it. Quote the value you were given. If a field
+  you were asked about is absent from that block, say you don't have it — never guess
+  a number.
 - Small talk / nothing to do: action "", track_ids empty.
 - `track_ids` must be ids returned by the search tools — copy them exactly, never invent.
 
@@ -172,6 +177,15 @@ def _max_track_seconds() -> int:
     except ValueError:
         return _DEFAULT_MAX_TRACK_SECONDS
 
+
+# Nicer labels for the player-state fields the bot is known to send. Anything not
+# listed is still rendered (from its own key), so a new field needs no change here.
+_CONTEXT_LABELS = {
+    "now_playing": "Now playing",
+    "queue": "Queue",
+    "queue_len": "Queue length",
+    "volume": "Volume (1-10 scale)",
+}
 
 # Spoken when the model promised an action the service had to drop. Must be in
 # BOT_LANGUAGE; override via TEXT_ACTION_FAILED when the bot speaks another language.
@@ -580,17 +594,23 @@ class AgentService:
         who = request.session.user_name or "Unknown user"
         prompt = f"{who} says: {request.message}"
 
-        ctx = request.context or {}
+        # Render EVERY field the bot sent. This used to be a hardcoded list of
+        # known keys, which silently dropped everything else (`volume` never
+        # reached the model, so it truthfully answered "I can't see the volume").
+        # A new context field must work without a change here.
         parts: list[str] = []
-        if ctx.get("now_playing"):
-            parts.append(f"Now playing: {ctx['now_playing']}")
-        queue = ctx.get("queue")
-        if queue:
-            parts.append("Queue: " + "; ".join(str(item) for item in queue))
-        elif ctx.get("queue_len") is not None:
-            parts.append(f"Queue length: {ctx['queue_len']}")
-        if not parts and ctx:
-            parts.append(f"Player state: {ctx}")
+        for key, value in (request.context or {}).items():
+            if value is None or value == "" or value == []:
+                continue
+            if key == "queue_len" and (request.context or {}).get("queue"):
+                continue  # the queue itself is listed, its length would be noise
+            label = _CONTEXT_LABELS.get(key) or key.replace("_", " ").capitalize()
+            rendered = (
+                "; ".join(str(item) for item in value)
+                if isinstance(value, (list, tuple))
+                else str(value)
+            )
+            parts.append(f"{label}: {rendered}")
 
         if parts:
             prompt += "\n\nCurrent player state:\n" + "\n".join(parts)

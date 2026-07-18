@@ -408,6 +408,35 @@ class CleanForTtsTests(unittest.TestCase):
 
 
 class RenderAndPromptTests(unittest.TestCase):
+    def test_every_context_field_reaches_the_prompt(self):
+        # Regression: the field list was hardcoded, so `volume` never reached the
+        # model and it truthfully answered "I can't see the volume".
+        req = AgentRequest(
+            message="какая громкость?",
+            context={
+                "now_playing": "SOAD - Chop Suey!",
+                "queue": ["Deftones - Change"],
+                "queue_len": 1,
+                "volume": 5,
+            },
+        )
+        prompt = AgentService._format_prompt(req)
+        self.assertIn("Volume (1-10 scale): 5", prompt)
+        self.assertIn("Now playing: SOAD - Chop Suey!", prompt)
+        self.assertIn("Queue: Deftones - Change", prompt)
+
+    def test_unknown_context_field_is_still_rendered(self):
+        # A field the bot adds later must arrive without a change here.
+        req = AgentRequest(message="hi", context={"repeat_mode": "all"})
+        self.assertIn("Repeat mode: all", AgentService._format_prompt(req))
+
+    def test_empty_context_values_are_skipped(self):
+        req = AgentRequest(message="hi", context={"now_playing": None, "queue": [], "volume": 5})
+        prompt = AgentService._format_prompt(req)
+        self.assertIn("Volume (1-10 scale): 5", prompt)
+        self.assertNotIn("Now playing", prompt)
+        self.assertNotIn("Queue:", prompt)
+
     def test_render_tools_lists_names_as_strings(self):
         rendered = AgentService._render_tools(TOOLS)
         # Names are quoted string values, not function-signature-looking entries.
