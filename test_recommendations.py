@@ -5,6 +5,7 @@ Run: .venv/Scripts/python.exe -m unittest test_recommendations
 Nothing here touches the database, the search service or the LLM.
 """
 
+import asyncio
 import os
 import random
 import unittest
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from app.data.models import Track
-from app.recommendations import sampling, settings
+from app.recommendations import genres, sampling, settings
 from app.recommendations.cooldown import PlayStat, is_resting, rest_hours, resting_track_ids
 
 _COOLDOWN_ENV = {
@@ -146,6 +147,90 @@ class PickVariedTests(unittest.TestCase):
     def test_empty_input(self):
         self.assertEqual(sampling.pick_varied([], 5), [])
         self.assertEqual(sampling.pick_varied(self._tracks(5), 0), [])
+
+
+class GenreCacheTests(unittest.IsolatedAsyncioTestCase):
+    """Genres are looked up once per artist and remembered, because each lookup
+    takes about a second and the answer never changes."""
+
+    def setUp(self):
+        self.stored: dict[str, list[dict]] = {}
+        self.lookups: list[str] = []
+
+        async def fake_cached(artists):
+            return {a: self.stored[a] for a in artists if a in self.stored}
+
+        async def fake_store(artist, tags):
+            self.stored[artist] = tags
+
+        for target, replacement in (
+            ("cached_tags", fake_cached),
+            ("_store", fake_store),
+        ):
+            patch = mock.patch(f"app.recommendations.genres.{target}", replacement)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _search(self, answers: dict[str, list[dict]]):
+        search = mock.Mock()
+
+        async def tags(artist, limit=10):
+            self.lookups.append(artist)
+            return answers.get(artist, [])
+
+        search.tags = tags
+        return search
+
+    async def test_unknown_artist_is_looked_up_and_cached(self):
+        search = self._search({"Slipknot": [{"name": "nu metal", "weight": 100}]})
+        await genres.fetch_missing(["Slipknot"], search)
+        self.assertEqual(self.lookups, ["Slipknot"])
+        self.assertEqual(self.stored["Slipknot"][0]["name"], "nu metal")
+
+    async def test_already_cached_artist_is_not_looked_up_again(self):
+        self.stored["Slipknot"] = [{"name": "nu metal", "weight": 100}]
+        await genres.fetch_missing(["Slipknot"], self._search({}))
+        self.assertEqual(self.lookups, [])
+
+    async def test_artist_nobody_knows_is_cached_as_empty(self):
+        # Otherwise we would ask about the same obscure uploader on every play.
+        await genres.fetch_missing(["Mid9PHONK"], self._search({}))
+        self.assertEqual(self.stored["Mid9PHONK"], [])
+
+    async def test_each_artist_is_looked_up_once_even_if_repeated(self):
+        search = self._search({"Korn": [{"name": "nu metal", "weight": 90}]})
+        await genres.fetch_missing(["Korn", "Korn", "Korn"], search)
+        self.assertEqual(self.lookups, ["Korn"])
+
+    async def test_a_failing_lookup_does_not_lose_the_others(self):
+        search = mock.Mock()
+
+        async def tags(artist, limit=10):
+            if artist == "Broken":
+                raise RuntimeError("boom")
+            return [{"name": "metal", "weight": 100}]
+
+        search.tags = tags
+        await genres.fetch_missing(["Broken", "Pantera"], search)
+        self.assertNotIn("Broken", self.stored)
+        self.assertIn("Pantera", self.stored)
+
+    def test_warming_the_cache_does_nothing_without_a_loop(self):
+        # Called from scripts and tests where no event loop is running. It must
+        # not raise, and must not leave an un-awaited coroutine behind either.
+        genres.warm_cache_in_background(["Slipknot"])  # no loop here — must be a no-op
+
+    async def test_warming_the_cache_schedules_the_lookup(self):
+        done = asyncio.Event()
+
+        async def fake_fetch(artists):
+            self.lookups.extend(artists)
+            done.set()
+
+        with mock.patch("app.recommendations.genres.fetch_missing", fake_fetch):
+            genres.warm_cache_in_background(["Slipknot"])
+            await asyncio.wait_for(done.wait(), timeout=2)
+        self.assertEqual(self.lookups, ["Slipknot"])
 
 
 class SettingsTests(unittest.TestCase):

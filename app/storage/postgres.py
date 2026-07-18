@@ -78,6 +78,31 @@ class PlayEvent(Base):
     )
 
 
+class ArtistTags(Base):
+    """Genre tags for an artist, as told to us by the search service.
+
+    This is a cache, and it is also how listening history gets its genres: a play
+    event stores the artist, and the genres are looked up through here. Storing
+    tags on the play row instead would mean fetching them while the user waits
+    (~0.8s per artist) and repeating the same tags on every play of the track.
+
+    Tags barely ever change, so rows are refreshed only when they get old.
+    """
+
+    __tablename__ = "artist_tags"
+
+    # The artist name exactly as we asked for it — usually the messy YouTube
+    # uploader ("Death From Above 1979 - Topic"). The search service cleans it up
+    # on its side; we cache under what we sent so lookups always hit.
+    artist: Mapped[str] = mapped_column(Text, primary_key=True)
+    # [{"name": "nu metal", "weight": 100}, ...]. Empty list = we asked and the tag
+    # source genuinely doesn't know this artist; don't keep asking.
+    tags: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 def async_dsn() -> str:
     """Normalise POSTGRES_DSN to the asyncpg driver SQLAlchemy expects."""
     dsn = os.getenv("POSTGRES_DSN", "")

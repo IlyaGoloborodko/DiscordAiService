@@ -70,6 +70,26 @@ class SearchClient:
             "/charts", self._params(tag=tag, country=country, limit=limit), timeout=60
         )
 
+    async def tags(self, artist: str, track: str | None = None, limit: int = 10) -> list[dict]:
+        """Genre/style tags for an artist (or a specific track), strongest first.
+
+        Returns entries like {"name": "nu metal", "weight": 100}. An artist the tag
+        source doesn't know gives an empty list, not an error — the search service
+        also cleans up messy YouTube names ("Death From Above 1979 - Topic") before
+        looking them up.
+        """
+        params = self._params(artist=artist, track=track, limit=limit)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(f"{self.base_url}/tags", params=params)
+                resp.raise_for_status()
+                data = resp.json()
+        except (httpx.HTTPError, ValueError):
+            logger.warning("search-service /tags failed (params=%s)", params, exc_info=True)
+            return []
+
+        return [tag for tag in data.get("tags", []) if isinstance(tag, dict) and tag.get("name")]
+
     @staticmethod
     def _params(**kwargs: object) -> dict[str, object]:
         """Drop None values so optional query params are omitted rather than sent

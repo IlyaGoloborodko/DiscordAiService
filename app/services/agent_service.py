@@ -35,7 +35,7 @@ from app.data.models import (
     ToolSpec,
     Track,
 )
-from app.recommendations import cooldown, sampling
+from app.recommendations import cooldown, genres, sampling
 from app.recommendations import history as play_history
 from app.services.memory import MemoryStore
 from app.services.search_client import SearchClient
@@ -558,6 +558,12 @@ class AgentService:
                     tracks=tracks,
                     action=draft.action or "",
                     source_queries=deps.source_queries,
+                )
+                # Look up the genres of what just played, but don't make the user
+                # wait for it (~0.8s per new artist). Whatever this misses is
+                # fetched later, when the taste profile actually needs it.
+                genres.warm_cache_in_background(
+                    [track.uploader for track in tracks if track.uploader]
                 )
 
         return response

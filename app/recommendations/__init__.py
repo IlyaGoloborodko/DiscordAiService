@@ -12,10 +12,13 @@ Right now it does two things:
 reached the player. Later it also becomes the taste profile (which artists and
 genres this server likes), which is why it records more than the cooldown needs.
 
+`genres` fills in what kind of music each artist makes, cached in the database
+because looking it up takes about a second and the answer never changes.
+
 All the knobs live in `settings`. See tmp/recommendations-plan.md for the plan
 and the reasoning behind it.
 """
 
-from app.recommendations import cooldown, history, sampling, settings
+from app.recommendations import cooldown, genres, history, sampling, settings
 
-__all__ = ["cooldown", "history", "sampling", "settings"]
+__all__ = ["cooldown", "genres", "history", "sampling", "settings"]
