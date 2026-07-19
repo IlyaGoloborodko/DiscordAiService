@@ -312,6 +312,14 @@ class RestingFilterTests(unittest.TestCase):
             kept = deps.remember([self.SONG], include_resting=True)
         self.assertEqual([t.id for t in kept], ["a"])
 
+    def test_machine_turn_cannot_replay_the_recent_tracks(self):
+        # Real bug: the queue ran out, the model reached for "what were we playing"
+        # and re-served the whole previous hour, cooldown and all.
+        deps = AgentDeps(search=None, resting={"a"}, may_replay_recent=False)
+        with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
+            kept = deps.remember([self.SONG, self.OTHER], include_resting=deps.may_replay_recent)
+        self.assertEqual([t.id for t in kept], ["b"])
+
     def test_source_query_is_recorded(self):
         deps = AgentDeps(search=None)
         with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):

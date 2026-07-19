@@ -257,6 +257,11 @@ class AgentDeps:
     # Tracks that played recently enough to still be resting (see recommendations
     # .cooldown). Hidden from the model so it cannot pick them at all.
     resting: set[str] = field(default_factory=set)
+    # Whether "give me what we were listening to" is allowed to serve tracks that
+    # are still resting. True when a person asked for it in words; False when the
+    # turn was triggered by the bot itself (the queue ran dry, a DJ break), where
+    # the job is to find something NEW and replaying the last hour is a bug.
+    may_replay_recent: bool = True
     # Which search query produced each track, so the history can record a rough
     # genre for it ("metal", "phonk") until real tags exist.
     source_queries: dict[str, str] = field(default_factory=dict)
@@ -351,9 +356,14 @@ class AgentService:
             """Tracks this session played recently, newest first. Use for "continue
             the previous playlist", "put that back on", "what were we listening to" —
             these refer to real earlier tracks, so return them instead of searching."""
-            # These tracks are recent by definition, so they are all resting. The
-            # user asked for them by name, so the rest does not apply here.
-            return ctx.deps.remember(ctx.deps.recent[:limit], include_resting=True)
+            # These tracks are recent by definition, so they are all resting. When
+            # a person actually asked for them back, that is the point and the rest
+            # is waived. When the bot triggered this turn itself, it is not: the
+            # model reaches for this tool on "play the next set" too, and replaying
+            # the last hour is exactly what we are trying to avoid.
+            return ctx.deps.remember(
+                ctx.deps.recent[:limit], include_resting=ctx.deps.may_replay_recent
+            )
 
         @agent.tool
         async def get_top_charts(
@@ -488,7 +498,16 @@ class AgentService:
         # out. Loaded once per run and hidden from the model in `remember`.
         guild_id = request.session.guild_id or ""
         resting = cooldown.resting_track_ids(await play_history.load_play_stats(guild_id))
-        deps = AgentDeps(search=SearchClient(), recent=recent, resting=resting)
+        # The bot sends no user when it triggers a turn on its own — the queue ran
+        # out, or it is time for a DJ break. Nobody asked to hear anything again,
+        # so replaying what just played is not allowed on those turns.
+        asked_by_a_person = bool(request.session.user_id or request.session.user_name)
+        deps = AgentDeps(
+            search=SearchClient(),
+            recent=recent,
+            resting=resting,
+            may_replay_recent=asked_by_a_person,
+        )
 
         if request.tools:
             agent: Agent[AgentDeps, object] = self._build_toolcall_agent()
