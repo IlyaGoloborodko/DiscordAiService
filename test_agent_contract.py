@@ -14,6 +14,7 @@ from app.data.models import (
     AgentDraft,
     AgentRequest,
     AgentResponse,
+    AgentSession,
     ToolCallDraft,
     ToolCallResponse,
     ToolSpec,
@@ -273,6 +274,40 @@ class SilentCommandTests(_AgentRunHarness):
         _, resp = await self._run(draft, self.TOOLS)
         self.assertEqual(resp.tool_calls, [])
         self.assertEqual(resp.spoken_answer, "Сейчас громкость 5")
+
+
+class TriggerTests(unittest.TestCase):
+    """Only a person may ask to hear the last hour again. When the bot starts the
+    turn itself (queue ran out, DJ break) the job is to find something new."""
+
+    @staticmethod
+    def _asked(**kwargs):
+        from app.services.agent_service import _asked_by_a_person
+
+        session = AgentSession(**{k: v for k, v in kwargs.items() if k != "trigger"})
+        return _asked_by_a_person(
+            AgentRequest(message="x", session=session, trigger=kwargs.get("trigger"))
+        )
+
+    def test_explicit_user_trigger(self):
+        self.assertTrue(self._asked(trigger="user"))
+
+    def test_autoplay_and_dj_break_are_machine_turns(self):
+        self.assertFalse(self._asked(trigger="autoplay"))
+        self.assertFalse(self._asked(trigger="dj_break"))
+
+    def test_any_unknown_trigger_counts_as_machine(self):
+        # The bot may add new automatic reasons; anything but "user" is one.
+        self.assertFalse(self._asked(trigger="queue_stalled"))
+
+    def test_trigger_beats_the_guess(self):
+        # A machine turn that still names a user must stay a machine turn — this is
+        # exactly the silent failure the explicit field was added to prevent.
+        self.assertFalse(self._asked(trigger="autoplay", user_id="42", user_name="Sok"))
+
+    def test_falls_back_to_guessing_without_a_trigger(self):
+        self.assertTrue(self._asked(user_id="42"))
+        self.assertFalse(self._asked())
 
 
 class RestingFilterTests(unittest.TestCase):

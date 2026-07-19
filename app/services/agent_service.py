@@ -203,6 +203,23 @@ _DEFAULT_ACTION_FAILED = (
 )
 
 
+def _asked_by_a_person(request: AgentRequest) -> bool:
+    """Whether a human started this turn, rather than the bot talking to itself.
+
+    It matters because "play what we were listening to" is a real request from a
+    person, but a bug when the queue simply ran out — there the job is to find
+    something new, and replaying the last hour is what we are trying to stop.
+
+    The bot states this outright in `trigger`. Older bots don't send it, so we
+    fall back to guessing: machine turns arrive without a user attached. The
+    guess is only a fallback because it fails silently if the bot ever starts
+    naming a user on automatic turns.
+    """
+    if request.trigger:
+        return request.trigger == "user"
+    return bool(request.session.user_id or request.session.user_name)
+
+
 def _is_silent_command(tool_calls: list[ToolCall]) -> bool:
     """Whether this turn is a plain control the bot should just do, without talking.
 
@@ -498,15 +515,11 @@ class AgentService:
         # out. Loaded once per run and hidden from the model in `remember`.
         guild_id = request.session.guild_id or ""
         resting = cooldown.resting_track_ids(await play_history.load_play_stats(guild_id))
-        # The bot sends no user when it triggers a turn on its own — the queue ran
-        # out, or it is time for a DJ break. Nobody asked to hear anything again,
-        # so replaying what just played is not allowed on those turns.
-        asked_by_a_person = bool(request.session.user_id or request.session.user_name)
         deps = AgentDeps(
             search=SearchClient(),
             recent=recent,
             resting=resting,
-            may_replay_recent=asked_by_a_person,
+            may_replay_recent=_asked_by_a_person(request),
         )
 
         if request.tools:

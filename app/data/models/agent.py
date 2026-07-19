@@ -30,6 +30,13 @@ class ToolSpec(BaseModel):
 class AgentRequest(BaseModel):
     session: AgentSession = Field(default_factory=AgentSession)
     message: str
+    trigger: str | None = Field(
+        default=None,
+        description="Who started this turn: 'user' when a person spoke or typed, "
+        "'autoplay' when the queue ran out, 'dj_break' for the periodic DJ line. "
+        "Anything other than 'user' is treated as the bot talking to itself. "
+        "Absent (older bots) falls back to guessing from whether a user is named.",
+    )
     context: dict | None = Field(
         default=None,
         description="Optional current player state from the bot (now_playing, queue, queue_len).",
