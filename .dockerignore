@@ -1,0 +1,17 @@
+# Keep the build context small and, more importantly, keep secrets and the
+# host's virtualenv out of the image.
+
+.env
+.venv
+.git
+.github
+.idea
+.claude
+.mypy_cache
+.ruff_cache
+__pycache__
+**/__pycache__
+*.pyc
+tmp/
+test_*.py
+wyoming_tests.py

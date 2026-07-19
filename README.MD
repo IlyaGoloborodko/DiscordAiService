@@ -87,11 +87,42 @@ uv run alembic upgrade head
 
 ## Run
 
+### In Docker (how it runs on the server)
+
+```bash
+docker compose up -d --build
+```
+
+Brings up three containers: `ai`, `postgres`, `redis`. Migrations run inside the
+`ai` container before uvicorn starts, so a fresh database needs no extra step.
+`POSTGRES_PASSWORD` must be set in `.env` — compose refuses to start without it
+rather than silently creating a database with a blank password.
+
+The bot's own `docker-compose.yml` `include`s this file, which puts all three
+services in one network. **Service names are hostnames there**, so `ai`,
+`postgres` and `redis` must keep those names; the bot reaches this service at
+`http://ai:8000`. The addresses in `.env` point at `127.0.0.1` and are overridden
+in the `environment:` block of the `ai` service, because inside a container
+`127.0.0.1` means that same container.
+
+Published host ports (`8000`, `5433`, `6380`) are bound to `127.0.0.1` only —
+enough to curl an endpoint or point pgAdmin through an SSH tunnel, not exposed
+to the network.
+
+### By hand
+
 ```bash
 uv run python main.py
 ```
 
-Serves on `http://127.0.0.1:8066` (FastAPI docs at `/docs`).
+Serves on `http://127.0.0.1:8000` (FastAPI docs at `/docs`), with reload on.
+Host, port, reload and worker count come from `APP_HOST` / `APP_PORT` /
+`APP_RELOAD` / `APP_WORKERS`; the Dockerfile sets the first three itself. Needs
+Redis, Postgres and migrations set up as in Setup above.
+
+`GET /health` returns `{"status": "ok"}` and checks nothing but the process —
+Redis, Postgres and the search service are all best-effort, so the service stays
+useful (and must stay up) when one of them is down.
 
 ## Endpoints
 
@@ -150,6 +181,10 @@ All via `.env` (see [`.env.example`](.env.example)):
 | `TELEGRAM_BOT_TOKEN`  | —                      | Empty = no Telegram logging. From @BotFather.                       |
 | `TELEGRAM_CHAT_ID`    | —                      | Chat to send alerts to (negative id for a group).                   |
 | `TELEGRAM_LOG_LEVEL`  | `ERROR`                | Level forwarded to Telegram, independent of `LOG_LEVEL`.            |
+| `APP_HOST` / `APP_PORT` | `127.0.0.1` / `8000` | Where the server binds. Docker sets `0.0.0.0`.                     |
+| `APP_RELOAD` / `APP_WORKERS` | `true` / `3`    | Dev reload and worker count. Docker sets reload to `false`.         |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `discord_ai` / — / `discord_ai` | Only for docker-compose: creates the database and builds the DSN. |
+| `POSTGRES_PORT` / `REDIS_PORT` / `AI_PORT` | `5433` / `6380` / `8000` | Host ports the containers publish, on `127.0.0.1` only. |
 
 Changing `BOT_LANGUAGE`, `BOT_NAME`, or `BOT_NAME_FORMS` needs no code edits — the
 prompt is templated and reads them per request. Keep the TTS voice in

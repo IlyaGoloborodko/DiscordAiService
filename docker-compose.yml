@@ -1,13 +1,74 @@
+# Runs this service on its own: `docker compose up -d --build`.
+#
+# The Discord bot's compose file `include`s this one, which puts all three
+# services in one network. Service names become hostnames there, so this file
+# must keep the names it has: `ai`, `postgres`, `redis`.
+
 services:
+  ai:
+    build: .
+    container_name: discord-ai
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # These three override whatever .env says. The addresses in .env point at
+      # 127.0.0.1, which is correct when running by hand but means "this same
+      # container" in here. `environment` wins over `env_file`, so .env stays
+      # usable for local runs and nobody has to keep two copies of it.
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-discord_ai}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-discord_ai}
+      REDIS_URL: redis://redis:6379/0
+      SEARCH_SERVICE_URL: http://media-source-service:9000
+    ports:
+      # Bound to 127.0.0.1: the bot reaches this over the compose network, so
+      # there is no reason to expose it to the internet. This is only so you can
+      # curl the endpoints from the server itself.
+      - "127.0.0.1:${AI_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # Migrations run before the server does, so the first check must not be
+      # early enough to catch that and declare the service dead.
+      start_period: 60s
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: discord-ai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-discord_ai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-discord_ai}
+    volumes:
+      # Named volume, not a throwaway one: this holds the conversation memory
+      # and the play history the recommendations are built from. Recreating the
+      # container must not wipe months of listening.
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # Localhost only. Lets you point pgAdmin at the play history through an
+      # SSH tunnel, and lets a locally-run service use the containerised database.
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-discord_ai} -d ${POSTGRES_DB:-discord_ai}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   redis:
     image: redis:7-alpine
     container_name: discord-ai-redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
-    ports:
-      - "${REDIS_PORT:-6380}:6379"
     volumes:
       - redis-data:/data
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6380}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -15,4 +76,5 @@ services:
       retries: 5
 
 volumes:
+  postgres-data:
   redis-data:

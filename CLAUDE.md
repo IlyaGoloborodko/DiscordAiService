@@ -59,7 +59,8 @@ returns a reply + `tool_calls`. Local LLM over an OpenAI-compatible endpoint
 
 ```bash
 uv sync                                      # install deps (uv, not pip)
-uv run python main.py                         # run service on :8066
+uv run python main.py                         # run service on :8000
+docker compose up -d --build                  # or run the whole thing in Docker
 uv run python -m unittest test_agent_contract -v   # unit tests (no live model)
 uv run alembic upgrade head                   # apply migrations
 uv run alembic revision --autogenerate -m "msg"    # new migration
