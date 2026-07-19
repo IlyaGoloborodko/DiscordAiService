@@ -455,7 +455,8 @@ class AgentService:
 
     @staticmethod
     def _bot_name() -> str:
-        return (os.getenv("BOT_NAME") or "Marina").strip() or "Marina"
+        # Deliberately impersonal: the persona lives in .env, not in the code.
+        return (os.getenv("BOT_NAME") or "Bot").strip() or "Bot"
 
     @staticmethod
     def _bot_name_forms(name: str) -> str:
@@ -582,7 +583,7 @@ class AgentService:
                 clarification=draft.clarification,
             )
 
-        # Persist only a CLEAN conversational turn: the user's message and Marina's
+        # Persist only a CLEAN conversational turn: the user's message and the bot's
         # reply text — never the raw agentic transcript (tool calls, tool returns,
         # reasoning). Replaying that scaffolding is fragile (strict chat templates
         # like qwen's reject a history that doesn't start with the system message or

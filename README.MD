@@ -140,7 +140,7 @@ All via `.env` (see [`.env.example`](.env.example)):
 | `TM_API_KEY`          | `not-needed`           | API key (LM Studio ignores it).                                     |
 | `TM_MODEL_NAME`       | `qwen/qwen3.5-9b`      | Model id, must match what's loaded in the endpoint.                 |
 | `BOT_LANGUAGE`        | `English`              | Language the bot writes/speaks. **Must match the TTS voice.**       |
-| `BOT_NAME`            | `Marina`               | Persona name.                                                       |
+| `BOT_NAME`            | `Bot`                  | Persona name.                                                       |
 | `BOT_NAME_FORMS`      | —                      | Comma-separated forms the user addresses the bot by (declensions).  |
 | `SEARCH_SERVICE_URL`  | `http://127.0.0.1:9000`| DsBotSearchService base URL.                                        |
 | `POSTGRES_DSN`        | —                      | Postgres DSN (normalised to `postgresql+asyncpg://` internally).    |

@@ -68,7 +68,7 @@ async def confirm_play(
 
     Fills in the newest row for this track that is still waiting for confirmation.
     If there isn't one, the track was played without us — someone used the bot's
-    own commands instead of asking Marina — and we write a fresh row. That is
+    own commands instead of asking the bot — and we write a fresh row. That is
     real listening either way, and arguably the most honest kind.
     """
     if not guild_id or not track_id or played_ms <= 0:
@@ -89,7 +89,7 @@ async def confirm_play(
         async with get_sessionmaker()() as session:
             row = (await session.execute(waiting)).scalar_one_or_none()
             if row is None:
-                # Played outside of Marina, or this track has already been
+                # Played outside of the bot, or this track has already been
                 # confirmed once and is now playing again — either way, a new
                 # listen deserves its own row.
                 row = PlayEvent(

@@ -574,7 +574,7 @@ class RenderAndPromptTests(unittest.TestCase):
 
     def test_format_prompt_includes_now_playing_and_queue(self):
         req = AgentRequest(
-            message="Марина, что в очереди?",
+            message="Бот, что в очереди?",
             context={"now_playing": "Song A", "queue": ["Song B", "Song C"], "queue_len": 2},
         )
         prompt = AgentService._format_prompt(req)
@@ -624,7 +624,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(os.environ, _ENV), \
              mock.patch.object(svc, "_build_toolcall_agent", return_value=fake_agent) as build_tc, \
              mock.patch.object(svc, "_build_legacy_agent") as build_legacy:
-            req = AgentRequest(message="Марина, поставь бодрое", tools=TOOLS)
+            req = AgentRequest(message="Бот, поставь бодрое", tools=TOOLS)
             out = await svc.run(req)
 
         build_tc.assert_called_once_with()

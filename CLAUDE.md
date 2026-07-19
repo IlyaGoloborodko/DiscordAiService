@@ -37,7 +37,7 @@ returns a reply + `tool_calls`. Local LLM over an OpenAI-compatible endpoint
   whenever the response contract or model changes, so stale history can't poison
   the model as few-shot examples. (Currently `v6`, after the qwen3.5 switch.)
 - **Memory stores only clean conversational turns** — a `UserPromptPart` request +
-  a `TextPart` response (Marina's `display_text`) — **never the raw agentic
+  a `TextPart` response (the bot's `display_text`) — **never the raw agentic
   transcript** (tool calls, tool returns, reasoning). Replaying that scaffolding is
   fragile: strict chat templates (qwen) reject a history that doesn't start with the
   system message or has an orphaned tool-return, and it bloats context with search
