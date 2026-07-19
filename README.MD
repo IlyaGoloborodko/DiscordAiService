@@ -146,10 +146,30 @@ All via `.env` (see [`.env.example`](.env.example)):
 | `POSTGRES_DSN`        | —                      | Postgres DSN (normalised to `postgresql+asyncpg://` internally).    |
 | `REDIS_URL`           | `redis://127.0.0.1:6380/0` | Redis hot-cache URL.                                            |
 | `HISTORY_TOKEN_LIMIT` | `20000`                | Max tokens of intermediate history kept (system prompt + latest message are never trimmed). |
+| `LOG_LEVEL`           | `INFO`                 | Console log level.                                                  |
+| `TELEGRAM_BOT_TOKEN`  | —                      | Empty = no Telegram logging. From @BotFather.                       |
+| `TELEGRAM_CHAT_ID`    | —                      | Chat to send alerts to (negative id for a group).                   |
+| `TELEGRAM_LOG_LEVEL`  | `ERROR`                | Level forwarded to Telegram, independent of `LOG_LEVEL`.            |
 
 Changing `BOT_LANGUAGE`, `BOT_NAME`, or `BOT_NAME_FORMS` needs no code edits — the
 prompt is templated and reads them per request. Keep the TTS voice in
 `discordAudio` on the same language as `BOT_LANGUAGE`.
+
+## Logging
+
+Configured once in [`app/logging_setup.py`](app/logging_setup.py), called from
+`main.py` after `load_dotenv()`. Everything goes to the console at `LOG_LEVEL`;
+if a Telegram token and chat id are set, records at `TELEGRAM_LOG_LEVEL` and
+above are **also** sent to that chat.
+
+- Telegram sending happens on a **background thread** — a request is never held
+  up by a network call to Telegram, and an unreachable Telegram is silent.
+- Records from `httpx`/`httpcore`/the logging module itself are never forwarded,
+  otherwise sending a message would log, which would send a message, forever.
+- Messages are capped at 4000 chars, throttled to one per 3s, and dropped once
+  100 are queued — Telegram accepts roughly 20/min per chat.
+- `uvicorn.run(..., log_config=None)` keeps uvicorn from installing its own
+  handlers, so its errors reach Telegram too.
 
 ## Memory
 
