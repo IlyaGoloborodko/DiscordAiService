@@ -80,7 +80,7 @@ class PlayEvent(Base):
     played_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
-        # "has this track played recently, and how often" — the cooldown lookup.
+        # "when did this track recently play here" — the freshness lookup.
         Index("ix_play_events_guild_track_time", "guild_id", "track_id", "played_at"),
         # "what has this server been listening to lately" — taste profiles later.
         Index("ix_play_events_guild_time", "guild_id", "played_at"),

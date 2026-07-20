@@ -1,4 +1,4 @@
-"""Tests for the recommendation system (cooldown + varied picking).
+"""Tests for the recommendation system (freshness + varied picking).
 
 Run: .venv/Scripts/python.exe -m unittest test_recommendations
 
@@ -14,12 +14,13 @@ from unittest import mock
 
 from app.data.models import Track
 from app.recommendations import genres, sampling, settings
-from app.recommendations.cooldown import PlayStat, is_resting, rest_hours, resting_track_ids
+from app.recommendations.freshness import Play, soft_multiplier, staleness, within_floor
 
-_COOLDOWN_ENV = {
-    "PLAY_COOLDOWN_BASE_HOURS": "6",
-    "PLAY_COOLDOWN_GROWTH": "2.0",
-    "PLAY_COOLDOWN_MAX_HOURS": "336",
+_FRESHNESS_ENV = {
+    "FRESHNESS_HALFLIFE_HOURS": "24",
+    "FRESHNESS_HALFLIFE_UNHEARD_HOURS": "2",
+    "FRESHNESS_WEIGHT": "1.0",
+    "FRESHNESS_ABSOLUTE_MIN_MINUTES": "45",
 }
 
 
@@ -27,70 +28,84 @@ def _hours_ago(hours: float) -> datetime:
     return datetime.now(timezone.utc) - timedelta(hours=hours)
 
 
-class RestLengthTests(unittest.TestCase):
-    """The more often a track has played, the longer it rests."""
-
-    def test_rest_doubles_with_each_play(self):
-        with mock.patch.dict(os.environ, _COOLDOWN_ENV):
-            self.assertEqual(rest_hours(1), 6)
-            self.assertEqual(rest_hours(2), 12)
-            self.assertEqual(rest_hours(3), 24)
-
-    def test_a_track_never_played_does_not_rest(self):
-        with mock.patch.dict(os.environ, _COOLDOWN_ENV):
-            self.assertEqual(rest_hours(0), 0)
-
-    def test_rest_stops_growing_at_the_cap(self):
-        # Without a cap a much-loved track would be banned for years.
-        with mock.patch.dict(os.environ, _COOLDOWN_ENV):
-            self.assertEqual(rest_hours(50), 336)
-
-    def test_cap_is_configurable(self):
-        with mock.patch.dict(os.environ, {**_COOLDOWN_ENV, "PLAY_COOLDOWN_MAX_HOURS": "10"}):
-            self.assertEqual(rest_hours(5), 10)
+def _heard(hours_ago: float) -> Play:
+    return Play(played_at=_hours_ago(hours_ago), heard=True)
 
 
-class RestingTests(unittest.TestCase):
-    """Whether a specific track is resting right now."""
+def _queued(hours_ago: float) -> Play:
+    return Play(played_at=_hours_ago(hours_ago), heard=False)
 
-    def test_just_played_is_resting(self):
-        with mock.patch.dict(os.environ, _COOLDOWN_ENV):
-            self.assertTrue(is_resting(PlayStat(1, _hours_ago(1))))
 
-    def test_played_long_enough_ago_is_free(self):
-        with mock.patch.dict(os.environ, _COOLDOWN_ENV):
-            self.assertFalse(is_resting(PlayStat(1, _hours_ago(7))))
+class StalenessTests(unittest.TestCase):
+    """Staleness = the sum of every play's fading score. Higher = held back more."""
 
-    def test_often_played_track_rests_longer(self):
-        # 7 hours is enough after one play, but not after three.
-        with mock.patch.dict(os.environ, _COOLDOWN_ENV):
-            self.assertFalse(is_resting(PlayStat(1, _hours_ago(7))))
-            self.assertTrue(is_resting(PlayStat(3, _hours_ago(7))))
+    def test_no_history_is_not_stale(self):
+        with mock.patch.dict(os.environ, _FRESHNESS_ENV):
+            self.assertEqual(staleness([]), 0.0)
+
+    def test_a_fresh_play_scores_about_one(self):
+        # A play right now weighs ~1 (0.5^0); a play one half-life old weighs ~0.5.
+        with mock.patch.dict(os.environ, _FRESHNESS_ENV):
+            self.assertAlmostEqual(staleness([_heard(0)]), 1.0, places=2)
+            self.assertAlmostEqual(staleness([_heard(24)]), 0.5, places=2)
+
+    def test_it_fades_to_nothing(self):
+        # A play from long ago weighs almost nothing: the track drifts back to base.
+        with mock.patch.dict(os.environ, _FRESHNESS_ENV):
+            self.assertLess(staleness([_heard(24 * 8)]), 0.01)
+
+    def test_more_plays_pile_up(self):
+        # Several recent plays add up — "played a lot lately" -> pushed down harder.
+        with mock.patch.dict(os.environ, _FRESHNESS_ENV):
+            one = staleness([_heard(1)])
+            three = staleness([_heard(1), _heard(2), _heard(3)])
+            self.assertGreater(three, one * 2)
+
+    def test_unheard_fades_faster_than_heard(self):
+        # At the same age, a merely-queued play weighs less than a listened-to one.
+        with mock.patch.dict(os.environ, _FRESHNESS_ENV):
+            self.assertLess(staleness([_queued(3)]), staleness([_heard(3)]))
 
     def test_naive_timestamp_is_treated_as_utc(self):
         # Postgres can hand back a timestamp without a timezone; it must not crash.
         naive = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)
-        with mock.patch.dict(os.environ, _COOLDOWN_ENV):
-            self.assertTrue(is_resting(PlayStat(1, naive)))
+        with mock.patch.dict(os.environ, _FRESHNESS_ENV):
+            self.assertGreater(staleness([Play(played_at=naive, heard=True)]), 0.9)
 
-    def test_queued_but_never_heard_gets_only_the_short_rest(self):
-        # The listener was handed 5 tracks and heard 2. The other 3 must not be
-        # pushed away as if they had been listened to — but they still rest
-        # briefly, because they may be sitting in the queue right now.
-        never_heard = PlayStat(play_count=0, last_played_at=_hours_ago(1))
-        with mock.patch.dict(os.environ, _COOLDOWN_ENV):
-            self.assertTrue(is_resting(never_heard))                     # 1h < 6h
-            self.assertFalse(is_resting(PlayStat(0, _hours_ago(7))))     # 7h > 6h
-            # ...while a track heard three times is still resting at 7 hours.
-            self.assertTrue(is_resting(PlayStat(3, _hours_ago(7))))
 
-    def test_picks_out_only_the_resting_ones(self):
-        stats = {
-            "fresh": PlayStat(1, _hours_ago(1)),   # played an hour ago -> resting
-            "old": PlayStat(1, _hours_ago(48)),    # played two days ago -> free
-        }
-        with mock.patch.dict(os.environ, _COOLDOWN_ENV):
-            self.assertEqual(resting_track_ids(stats), {"fresh"})
+class SoftMultiplierTests(unittest.TestCase):
+    """The factor a track's pick weight is multiplied by: 1 = untouched, less = held back."""
+
+    def test_untouched_track_keeps_full_weight(self):
+        with mock.patch.dict(os.environ, _FRESHNESS_ENV):
+            self.assertEqual(soft_multiplier([]), 1.0)
+
+    def test_recent_play_lowers_the_weight_but_never_to_zero(self):
+        with mock.patch.dict(os.environ, _FRESHNESS_ENV):
+            factor = soft_multiplier([_heard(1)])
+            self.assertLess(factor, 1.0)
+            self.assertGreater(factor, 0.0)
+
+    def test_weight_zero_means_ignore_history(self):
+        with mock.patch.dict(os.environ, {**_FRESHNESS_ENV, "FRESHNESS_WEIGHT": "0"}):
+            self.assertEqual(soft_multiplier([_heard(0)]), 1.0)
+
+
+class FloorTests(unittest.TestCase):
+    """The hard floor: a just-played track is held out completely for a few minutes."""
+
+    def test_played_moments_ago_is_floored(self):
+        with mock.patch.dict(os.environ, _FRESHNESS_ENV):
+            self.assertTrue(within_floor([Play(_hours_ago(0.5), heard=True)]))  # 30min < 45min
+
+    def test_past_the_floor_is_free(self):
+        with mock.patch.dict(os.environ, _FRESHNESS_ENV):
+            self.assertFalse(within_floor([_heard(1)]))  # 60min > 45min
+
+    def test_a_queued_track_is_floored_too(self):
+        # It may be sitting in the queue right now; do not offer it a second time.
+        with mock.patch.dict(os.environ, _FRESHNESS_ENV):
+            self.assertTrue(within_floor([Play(_hours_ago(0.1), heard=False)]))
 
 
 class PoolSizeTests(unittest.TestCase):
@@ -158,6 +173,81 @@ class PickVariedTests(unittest.TestCase):
     def test_empty_input(self):
         self.assertEqual(sampling.pick_varied([], 5), [])
         self.assertEqual(sampling.pick_varied(self._tracks(5), 0), [])
+
+
+class FreshnessWeightingTests(unittest.TestCase):
+    """`soft` holds recently-played tracks back; `floored` holds them out entirely."""
+
+    @staticmethod
+    def _tracks(count: int) -> list[Track]:
+        return [Track(id=str(i), title=f"Song {i}") for i in range(count)]
+
+    def test_a_held_back_track_is_picked_less(self):
+        # Track "0" would normally dominate (top rank); a low soft factor should
+        # make it show up far less often than without it.
+        rng = random.Random(1)
+        tracks = self._tracks(10)
+        held = sum(
+            1 for _ in range(200)
+            if "0" in {t.id for t in sampling.pick_varied(tracks, 3, rng=rng, soft={"0": 0.01})}
+        )
+        rng = random.Random(1)
+        free = sum(
+            1 for _ in range(200)
+            if "0" in {t.id for t in sampling.pick_varied(tracks, 3, rng=rng)}
+        )
+        self.assertLess(held, free)
+
+    def test_a_floored_track_is_never_picked(self):
+        # ...as long as there are other candidates to fill the request.
+        tracks = self._tracks(10)
+        for seed in range(30):
+            picked = sampling.pick_varied(tracks, 3, rng=random.Random(seed), floored={"0", "1"})
+            self.assertNotIn("0", {t.id for t in picked})
+            self.assertNotIn("1", {t.id for t in picked})
+
+    def test_floor_relaxes_when_everything_is_floored(self):
+        # Better a repeat than handing back nothing: if every candidate is floored,
+        # the floor is ignored and we still return a full set.
+        tracks = self._tracks(4)
+        picked = sampling.pick_varied(
+            tracks, 3, rng=random.Random(0), floored={"0", "1", "2", "3"}
+        )
+        self.assertEqual(len(picked), 3)
+
+
+class ArtistSeparationTests(unittest.TestCase):
+    """One artist should not fill the whole selection when others are available."""
+
+    @staticmethod
+    def _by(artists: list[str]) -> list[Track]:
+        return [Track(id=str(i), title=f"Song {i}", uploader=a) for i, a in enumerate(artists)]
+
+    def test_spreads_across_artists(self):
+        # 3 tracks by "Olivia" up top, then others. They rank highest, so without
+        # separation a 3-track pick is often all-Olivia; turning it on must make
+        # that markedly rarer.
+        tracks = self._by(["Olivia", "Olivia", "Olivia", "Malcolm", "Ariana", "Bag Raiders"])
+
+        def all_olivia_rate(gamma: str) -> int:
+            with mock.patch.dict(
+                os.environ, {"ARTIST_SEPARATION_WEIGHT": gamma, "CANDIDATE_RANK_BIAS": "2"}
+            ):
+                rng = random.Random(1)
+                return sum(
+                    1 for _ in range(200)
+                    if {t.uploader for t in sampling.pick_varied(tracks, 3, rng=rng)} == {"Olivia"}
+                )
+
+        self.assertLess(all_olivia_rate("8"), all_olivia_rate("0"))
+
+    def test_single_artist_pool_is_a_no_op(self):
+        # "queue by [artist]": the whole pool is one artist, so separation must not
+        # break it — the request still gets its tracks.
+        tracks = self._by(["Slipknot"] * 8)
+        with mock.patch.dict(os.environ, {"ARTIST_SEPARATION_WEIGHT": "5"}):
+            picked = sampling.pick_varied(tracks, 5, rng=random.Random(3))
+        self.assertEqual(len(picked), 5)
 
 
 class GenreCacheTests(unittest.IsolatedAsyncioTestCase):
@@ -248,12 +338,14 @@ class SettingsTests(unittest.TestCase):
     """Knobs fall back to sane defaults rather than crashing."""
 
     def test_garbage_value_falls_back(self):
-        with mock.patch.dict(os.environ, {"PLAY_COOLDOWN_BASE_HOURS": "six"}):
-            self.assertEqual(settings.cooldown_base_hours(), 6)
+        with mock.patch.dict(os.environ, {"FRESHNESS_HALFLIFE_HOURS": "a day"}):
+            self.assertEqual(settings.freshness_halflife_hours(), 24)
 
     def test_missing_value_falls_back(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(settings.cooldown_growth(), 2.0)
+            self.assertEqual(settings.freshness_weight(), 1.0)
+            self.assertEqual(settings.freshness_floor_minutes(), 45)
+            self.assertEqual(settings.artist_separation_weight(), 1.0)
             self.assertEqual(settings.rank_bias(), 1.5)
 
 

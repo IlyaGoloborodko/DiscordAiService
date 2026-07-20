@@ -35,7 +35,7 @@ from app.data.models import (
     ToolSpec,
     Track,
 )
-from app.recommendations import cooldown, genres, sampling
+from app.recommendations import freshness, genres, sampling
 from app.recommendations import history as play_history
 from app.services.memory import MemoryStore
 from app.services.search_client import SearchClient
@@ -113,9 +113,20 @@ to ONE action name from the list below (a plain string), or "" for no action.
 
 MANDATORY: if the user wants music (put on / start / play / add / a genre / a mood /
 an artist / "your choice"), FIRST call a search tool to get real tracks, THEN call
-`final_result` with action "play" or "enqueue" and `track_ids` set to the ids you
-just got. Never describe music in display_text without setting an action + track_ids.
+`final_result` with the music action that matches the request (see "Which music action"
+below) and `track_ids` set to the ids you just got. Never describe music in display_text
+without setting an action + track_ids.
 If unsure of the genre, still pick a popular selection and offer to refine next time.
+
+Which music action to use — match the user's intent:
+- replace_queue — an open or fresh request, no attachment to what's on now
+  ("включи что-нибудь", "давай другую подборку", "поставь вчерашнюю очередь",
+  "play me some phonk"). The user wants a NEW set, so the old queue is cleared.
+  When in doubt on an open request, choose this.
+- play — specific track(s) wanted RIGHT NOW while keeping the rest of the queue
+  ("поставь вот эту", "включи X следующей", "в начало очереди"). It goes to the
+  FRONT; the current queue continues after it, nothing is thrown away.
+- enqueue — ADD to what's already lined up ("добавь ещё", "в конец", "ещё пару таких").
 
 Some actions take arguments of their own — they are listed after the action name
 below. Put those in `action_args_json` as a flat JSON object using exactly the listed
@@ -271,11 +282,11 @@ class AgentDeps:
     # model answer "continue the previous playlist" — the Discord bot forgets its
     # queue on restart, so the service is the only place this survives.
     recent: list[Track] = field(default_factory=list)
-    # Tracks that played recently enough to still be resting (see recommendations
-    # .cooldown). Hidden from the model so it cannot pick them at all.
-    resting: set[str] = field(default_factory=set)
+    # Recent plays of each track on this server, keyed by id (see recommendations
+    # .freshness). Used to hold back what played recently — never to hide it.
+    plays: dict[str, list[freshness.Play]] = field(default_factory=dict)
     # Whether "give me what we were listening to" is allowed to serve tracks that
-    # are still resting. True when a person asked for it in words; False when the
+    # only just played. True when a person asked for it in words; False when the
     # turn was triggered by the bot itself (the queue ran dry, a DJ break), where
     # the job is to find something NEW and replaying the last hour is a bug.
     may_replay_recent: bool = True
@@ -283,35 +294,34 @@ class AgentDeps:
     # genre for it ("metal", "phonk") until real tags exist.
     source_queries: dict[str, str] = field(default_factory=dict)
 
-    def remember(
-        self, tracks: list[Track], query: str = "", include_resting: bool = False
-    ) -> list[Track]:
+    def remember(self, tracks: list[Track], query: str = "") -> list[Track]:
         """Cache what a search tool found and return what the model may use.
 
-        Two kinds of track never make it through: hour-long compilations, and
-        tracks that are still resting after playing recently. `include_resting`
-        is for the one tool that deliberately returns recent tracks.
+        Only the length filter drops anything here: hour-long compilations are
+        removed because the bot treats each hit as one un-skippable track. Recent
+        tracks are NOT dropped — freshness holds them back later, in `pick`, as a
+        weight rather than a filter, so nothing is ever fully hidden.
         """
         real_tracks = [track for track in tracks if fits_duration(track)]
-        keep = (
-            real_tracks
-            if include_resting
-            else [track for track in real_tracks if track.id not in self.resting]
-        )
-        # Some genres are almost entirely hour-long mixes — a search for "phonk"
-        # comes back with 25 results of which 4 are actual songs. Once those four
-        # have played, resting them all would leave nothing at all, and the user
-        # would be told we found nothing. Hearing a track again is better than
-        # that, so when the rest empties the list we ignore it. The length filter
-        # is never relaxed: an hour-long mix breaks the player's queue.
-        if not keep and real_tracks:
-            logger.info("all %d candidates were resting; letting them through", len(real_tracks))
-            keep = real_tracks
-        for track in keep:
+        for track in real_tracks:
             self.found[track.id] = track
             if query and track.id not in self.source_queries:
                 self.source_queries[track.id] = query
-        return keep
+        return real_tracks
+
+    def pick(self, tracks: list[Track], wanted: int) -> list[Track]:
+        """Choose which of the found tracks to offer: bias to the top, hold back
+        what played recently, and spread artists out (see sampling.pick_varied)."""
+        soft: dict[str, float] = {}
+        floored: set[str] = set()
+        for track in tracks:
+            plays = self.plays.get(track.id)
+            if not plays:
+                continue  # never played here -> full weight, nothing to hold back
+            soft[track.id] = freshness.soft_multiplier(plays)
+            if freshness.within_floor(plays):
+                floored.add(track.id)
+        return sampling.pick_varied(tracks, wanted, soft=soft, floored=floored)
 
 
 class AgentService:
@@ -342,7 +352,7 @@ class AgentService:
         ) -> list[Track]:
             """Search for tracks by a free-text query (artist, track, genre, mood)."""
             found = await ctx.deps.search.search(query, sampling.pool_size(limit))
-            return sampling.pick_varied(ctx.deps.remember(found, query), limit)
+            return ctx.deps.pick(ctx.deps.remember(found, query), limit)
 
         @agent.tool
         async def get_playlist_tracks(
@@ -366,21 +376,24 @@ class AgentService:
             found = await ctx.deps.search.similar(
                 artist, track or None, sampling.pool_size(limit)
             )
-            return sampling.pick_varied(ctx.deps.remember(found, artist), limit)
+            return ctx.deps.pick(ctx.deps.remember(found, artist), limit)
 
         @agent.tool
         async def get_recently_played(ctx: RunContext[AgentDeps], limit: int = 20) -> list[Track]:
             """Tracks this session played recently, newest first. Use for "continue
             the previous playlist", "put that back on", "what were we listening to" —
             these refer to real earlier tracks, so return them instead of searching."""
-            # These tracks are recent by definition, so they are all resting. When
-            # a person actually asked for them back, that is the point and the rest
-            # is waived. When the bot triggered this turn itself, it is not: the
-            # model reaches for this tool on "play the next set" too, and replaying
-            # the last hour is exactly what we are trying to avoid.
-            return ctx.deps.remember(
-                ctx.deps.recent[:limit], include_resting=ctx.deps.may_replay_recent
-            )
+            # When a person actually asked for these back, that is the point —
+            # return them as they are, freshness and all. When the bot triggered
+            # this turn itself, it is not: the model reaches for this tool on
+            # "play the next set" too, and replaying what just played is exactly
+            # what we are trying to avoid, so drop the ones inside the hard floor.
+            # If every one is (nothing older to offer), let them through.
+            tracks = ctx.deps.remember(ctx.deps.recent[:limit])
+            if not ctx.deps.may_replay_recent:
+                fresh = [t for t in tracks if not freshness.within_floor(ctx.deps.plays.get(t.id, []))]
+                tracks = fresh or tracks
+            return tracks
 
         @agent.tool
         async def get_top_charts(
@@ -402,7 +415,7 @@ class AgentService:
                 # (action set, no track ids) or silently retries with no tag at all,
                 # which is the global top — pop/hip-hop regardless of what was asked.
                 tracks = await ctx.deps.search.search(tag, pool)
-            return sampling.pick_varied(ctx.deps.remember(tracks, tag or country), limit)
+            return ctx.deps.pick(ctx.deps.remember(tracks, tag or country), limit)
 
     # The system prompt is injected fresh into message_history each run (see run),
     # not set on the Agent — so it can never be lost when memory trims history and
@@ -512,14 +525,14 @@ class AgentService:
         session_key = self._session_key(request)
         intermediate = await self.memory.load(session_key)
         recent = [Track(**data) for data in await self.memory.load_tracks(session_key)]
-        # Tracks this server heard recently enough that they should sit this one
-        # out. Loaded once per run and hidden from the model in `remember`.
+        # Recent plays for this server, loaded once per run. Used in `pick` to
+        # hold back what played recently rather than to hide it.
         guild_id = request.session.guild_id or ""
-        resting = cooldown.resting_track_ids(await play_history.load_play_stats(guild_id))
+        plays = await play_history.load_plays(guild_id)
         deps = AgentDeps(
             search=SearchClient(),
             recent=recent,
-            resting=resting,
+            plays=plays,
             may_replay_recent=_asked_by_a_person(request),
         )
 

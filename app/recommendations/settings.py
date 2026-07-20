@@ -17,20 +17,35 @@ def _number(name: str, default: float) -> float:
         return default
 
 
-def cooldown_base_hours() -> float:
-    """How long a track rests after being played once."""
-    return _number("PLAY_COOLDOWN_BASE_HOURS", 6)
+def freshness_halflife_hours() -> float:
+    """After this long, a HEARD play counts for half as much toward holding a
+    track back (then a quarter, an eighth...). Sets how long a track you actually
+    listened to stays quieter before drifting back to normal."""
+    return _number("FRESHNESS_HALFLIFE_HOURS", 24)
 
 
-def cooldown_growth() -> float:
-    """How much longer the rest gets each time the track is played again.
-    2.0 means it doubles: 6h, then 12h, then 24h..."""
-    return _number("PLAY_COOLDOWN_GROWTH", 2.0)
+def freshness_halflife_unheard_hours() -> float:
+    """Same, for a track that was only queued and never actually heard. Short on
+    purpose: it just needs to not be offered twice while it's still in the queue."""
+    return _number("FRESHNESS_HALFLIFE_UNHEARD_HOURS", 2)
 
 
-def cooldown_max_hours() -> float:
-    """The rest never grows past this, so a favourite is never banned forever."""
-    return _number("PLAY_COOLDOWN_MAX_HOURS", 336)  # two weeks
+def freshness_weight() -> float:
+    """How hard staleness pushes a track down. 0 = ignore play history entirely;
+    higher = a recently or often played track is held back harder."""
+    return max(0.0, _number("FRESHNESS_WEIGHT", 1.0))
+
+
+def freshness_floor_minutes() -> float:
+    """A track that played this recently is held out completely (weight 0) —
+    unless every candidate is, in which case the rule is relaxed."""
+    return _number("FRESHNESS_ABSOLUTE_MIN_MINUTES", 45)
+
+
+def artist_separation_weight() -> float:
+    """How hard to avoid several tracks by the same artist in one selection.
+    0 = don't care; higher = spread artists out more."""
+    return max(0.0, _number("ARTIST_SEPARATION_WEIGHT", 1.0))
 
 
 def pool_factor() -> float:

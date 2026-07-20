@@ -12,14 +12,17 @@ because of it would be worse.
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.data.models import Track
-from app.recommendations import settings
-from app.recommendations.cooldown import PlayStat
+from app.recommendations import freshness, settings
 from app.storage import PlayEvent, get_sessionmaker
 
 logger = logging.getLogger(__name__)
+
+# How many half-lives back to bother loading. Past this a play's fading score is
+# under 0.5^8 ≈ 0.4% — it changes nothing, so leaving it out just keeps the query small.
+_HORIZON_HALFLIVES = 8
 
 
 async def record_plays(
@@ -108,41 +111,35 @@ async def confirm_play(
         logger.warning("could not confirm play of %s in %s", track_id, guild_id, exc_info=True)
 
 
-async def load_play_stats(guild_id: str) -> dict[str, PlayStat]:
-    """How often each track has played on this server, and when it last did.
+async def load_plays(guild_id: str) -> dict[str, list[freshness.Play]]:
+    """Every recent play of every track on this server, grouped by track.
 
-    Only tracks played inside the longest possible rest are returned — anything
-    older cannot be resting any more, so there is no point loading it. That
-    keeps this query small no matter how long the history grows.
+    We return the individual plays, not a count — freshness sums each play's
+    fading score on the fly (no stored counters). Only plays inside the window
+    where that score still matters are loaded (a few half-lives back); older ones
+    weigh ~0 and would just bloat the query. `heard` is True when the bot later
+    confirmed the track actually reached the speakers (`played_ms` is set).
     """
     if not guild_id:
         return {}
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.cooldown_max_hours())
+    horizon = max(settings.freshness_halflife_hours(), settings.freshness_halflife_unheard_hours())
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=horizon * _HORIZON_HALFLIVES)
     query = (
-        select(
-            PlayEvent.track_id,
-            # Only tracks we know were HEARD make the rest grow. A track that sat
-            # in the queue and never reached the speakers shouldn't be pushed away
-            # for days — nobody got tired of it.
-            func.count(PlayEvent.played_ms).label("play_count"),
-            # ...but the clock runs from the last time we handed it over, heard or
-            # not, so we don't put the same track in the queue twice.
-            func.max(PlayEvent.played_at).label("last_played_at"),
-        )
-        .where(PlayEvent.guild_id == guild_id)
-        .group_by(PlayEvent.track_id)
-        .having(func.max(PlayEvent.played_at) >= cutoff)
+        select(PlayEvent.track_id, PlayEvent.played_at, PlayEvent.played_ms)
+        .where(PlayEvent.guild_id == guild_id, PlayEvent.played_at >= cutoff)
     )
 
     try:
         async with get_sessionmaker()() as session:
             rows = (await session.execute(query)).all()
     except Exception:
-        logger.warning("could not load play stats for %s", guild_id, exc_info=True)
+        logger.warning("could not load plays for %s", guild_id, exc_info=True)
         return {}
 
-    return {
-        row.track_id: PlayStat(play_count=row.play_count, last_played_at=row.last_played_at)
-        for row in rows
-    }
+    plays: dict[str, list[freshness.Play]] = {}
+    for row in rows:
+        plays.setdefault(row.track_id, []).append(
+            freshness.Play(played_at=row.played_at, heard=row.played_ms is not None)
+        )
+    return plays

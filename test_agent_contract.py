@@ -8,8 +8,10 @@ so no Redis/Postgres is needed.
 
 import os
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
+from app.recommendations.freshness import Play
 from app.data.models import (
     AgentDraft,
     AgentRequest,
@@ -310,56 +312,102 @@ class TriggerTests(unittest.TestCase):
         self.assertFalse(self._asked())
 
 
-class RestingFilterTests(unittest.TestCase):
-    """Tracks that played recently are hidden from the model — unless hiding them
-    would leave it with nothing to offer."""
+def _minutes_ago(minutes: float) -> datetime:
+    return datetime.now(timezone.utc) - timedelta(minutes=minutes)
+
+
+class RememberTests(unittest.TestCase):
+    """`remember` only drops hour-long mixes now — recent tracks are held back
+    later by freshness (a weight), never hidden here (a filter)."""
 
     SONG = Track(id="a", title="Song", duration=200.0)
     OTHER = Track(id="b", title="Other", duration=210.0)
     MIX = Track(id="m", title="1 HOUR PHONK MIX", duration=3600.0)
 
-    def test_resting_track_is_hidden(self):
-        deps = AgentDeps(search=None, resting={"a"})
-        with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
-            kept = deps.remember([self.SONG, self.OTHER])
-        self.assertEqual([t.id for t in kept], ["b"])
-        self.assertNotIn("a", deps.found)
-
-    def test_all_resting_falls_back_to_repeating(self):
-        # Real case: a "phonk" search is nearly all hour-long mixes, so once the
-        # few real tracks have played there is nothing left. Repeating beats
-        # telling the user we found nothing.
-        deps = AgentDeps(search=None, resting={"a", "b"})
+    def test_recent_track_is_kept_not_hidden(self):
+        # "a" played moments ago, but remember still returns it: freshness will
+        # lower its odds in pick(), it is not filtered out here.
+        deps = AgentDeps(search=None, plays={"a": [Play(_minutes_ago(1), heard=True)]})
         with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
             kept = deps.remember([self.SONG, self.OTHER])
         self.assertEqual([t.id for t in kept], ["a", "b"])
+        self.assertIn("a", deps.found)
 
-    def test_fallback_never_lets_long_mixes_through(self):
+    def test_long_mix_is_dropped(self):
         # The length filter is a hard rule: an hour-long mix breaks the queue.
-        deps = AgentDeps(search=None, resting={"a"})
+        deps = AgentDeps(search=None)
         with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
             kept = deps.remember([self.SONG, self.MIX])
-        self.assertEqual([t.id for t in kept], ["a"])  # fell back, but no mix
-
-    def test_recently_played_tool_ignores_resting(self):
-        deps = AgentDeps(search=None, resting={"a"})
-        with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
-            kept = deps.remember([self.SONG], include_resting=True)
         self.assertEqual([t.id for t in kept], ["a"])
-
-    def test_machine_turn_cannot_replay_the_recent_tracks(self):
-        # Real bug: the queue ran out, the model reached for "what were we playing"
-        # and re-served the whole previous hour, cooldown and all.
-        deps = AgentDeps(search=None, resting={"a"}, may_replay_recent=False)
-        with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
-            kept = deps.remember([self.SONG, self.OTHER], include_resting=deps.may_replay_recent)
-        self.assertEqual([t.id for t in kept], ["b"])
 
     def test_source_query_is_recorded(self):
         deps = AgentDeps(search=None)
         with mock.patch.dict(os.environ, {"MAX_TRACK_SECONDS": "600"}):
             deps.remember([self.SONG], "phonk")
         self.assertEqual(deps.source_queries["a"], "phonk")
+
+
+class PickFreshnessTests(unittest.TestCase):
+    """`pick` turns each track's play history into the sampling weights. A floored
+    track has weight 0, so it never appears regardless of the RNG."""
+
+    _ENV = {"FRESHNESS_ABSOLUTE_MIN_MINUTES": "45", "FRESHNESS_WEIGHT": "1.0"}
+
+    @staticmethod
+    def _tracks(n):
+        return [Track(id=str(i), title=f"Song {i}") for i in range(n)]
+
+    def test_a_freshly_played_track_is_floored_out(self):
+        # "0" played 1 minute ago -> inside the floor -> never picked while others exist.
+        deps = AgentDeps(search=None, plays={"0": [Play(_minutes_ago(1), heard=True)]})
+        with mock.patch.dict(os.environ, self._ENV):
+            for _ in range(30):
+                picked = deps.pick(self._tracks(8), 3)
+                self.assertNotIn("0", {t.id for t in picked})
+
+    def test_no_history_picks_normally(self):
+        deps = AgentDeps(search=None)
+        with mock.patch.dict(os.environ, self._ENV):
+            picked = deps.pick(self._tracks(8), 3)
+        self.assertEqual(len(picked), 3)
+
+
+class RecentlyPlayedReplayTests(unittest.IsolatedAsyncioTestCase):
+    """get_recently_played: a person may replay just-played tracks; a machine turn
+    (autoplay / DJ break) may not — it must find something newer."""
+
+    @staticmethod
+    def _tool(agent):
+        return agent._function_toolset.tools["get_recently_played"].function
+
+    async def _call(self, recent, plays, may_replay_recent):
+        with mock.patch.dict(os.environ, {**_ENV, "FRESHNESS_ABSOLUTE_MIN_MINUTES": "45"}):
+            agent = AgentService()._build_toolcall_agent()
+            deps = AgentDeps(
+                search=None, recent=recent, plays=plays, may_replay_recent=may_replay_recent
+            )
+            return await self._tool(agent)(mock.Mock(deps=deps))
+
+    async def test_person_gets_the_recent_tracks_back(self):
+        recent = [Track(id="a", title="A"), Track(id="b", title="B")]
+        plays = {"a": [Play(_minutes_ago(1), heard=True)]}  # just played, but they asked
+        out = await self._call(recent, plays, may_replay_recent=True)
+        self.assertEqual({t.id for t in out}, {"a", "b"})
+
+    async def test_machine_turn_drops_the_just_played(self):
+        recent = [Track(id="a", title="A"), Track(id="b", title="B")]
+        plays = {"a": [Play(_minutes_ago(1), heard=True)]}  # a is floored, b is not
+        out = await self._call(recent, plays, may_replay_recent=False)
+        self.assertEqual([t.id for t in out], ["b"])
+
+    async def test_machine_turn_relaxes_when_all_just_played(self):
+        recent = [Track(id="a", title="A"), Track(id="b", title="B")]
+        plays = {
+            "a": [Play(_minutes_ago(1), heard=True)],
+            "b": [Play(_minutes_ago(2), heard=True)],
+        }
+        out = await self._call(recent, plays, may_replay_recent=False)
+        self.assertEqual({t.id for t in out}, {"a", "b"})  # nothing newer -> let them through
 
 
 class ChartsFallbackTests(unittest.IsolatedAsyncioTestCase):
